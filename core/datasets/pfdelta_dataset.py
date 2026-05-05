@@ -818,6 +818,7 @@ class PFDeltaDataset(InMemoryDataset):
                 for feas_type, feas_num in feas_values.items():
                     feas_values[feas_type] = feas_num // 2
 
+        all_data = []
         for feasibility, train_cfg_dict in task_config.items():
             test_cfg = self.test_config[feasibility]
 
@@ -925,6 +926,7 @@ class PFDeltaDataset(InMemoryDataset):
                         is_cpf_sample=is_cpf_sample
                     )
                     data_list.append(data)
+                all_data.extend(data_list)
 
                 # Collate and save
                 data, slices = self.collate(data_list)
@@ -938,7 +940,7 @@ class PFDeltaDataset(InMemoryDataset):
                     (data, slices), os.path.join(processed_path, f"{split}.pt")
                 )
 
-        return data_list
+        return all_data
 
     def process(self):
         """
