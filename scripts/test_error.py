@@ -58,7 +58,6 @@ if __name__ == "__main__":
         # Modify datasets
         base_dataset = config["dataset"]["datasets"][0]
         case_name = base_dataset["case_name"]
-        base_dataset["task"] = 4.1
         split = f"separate_{case_name}_test_"
         datasets = [
             {

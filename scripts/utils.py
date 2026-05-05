@@ -40,6 +40,7 @@ def load_config(run_location):
     with open(config_location, "r") as f:
         config = yaml.safe_load(f)
     config["functional"]["is_debug"] = True
+    config["functional"]["checkpoint"] = False
 
     return config
 
