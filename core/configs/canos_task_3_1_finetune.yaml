@@ -84,7 +84,7 @@ dataset:
     task: 1.3
 functional:
   run_location: canos_task_3_1_finetune
-  run_name: canos_k_steps15_hd256_lr1e-4_sgband_%sgband_cons_lam_%lamb_task_3_1_finetune
+  run_name: canos_k_steps15_hd256_lr1e-4_sgband_%min_size_cons_lam_%lamb_task_3_1_finetune
   is_debug: false
   seed: 11
   cpu: false
