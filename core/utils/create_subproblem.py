@@ -1,0 +1,447 @@
+"""
+Utilities for constructing power-flow "subproblems": a connected subgraph of
+a full power network, with tie-lines (branches leaving the subgraph) removed
+and their model-predicted flows folded into the boundary buses' net power
+injection.
+
+This underlies a self-consistency train-time augmentation aimed at PFDelta
+task 3.1 (transfer to unseen grid sizes/topologies): predict on the full
+grid, cut out a random connected subgraph, replace everything the subgraph
+can't see with an equivalent injection at the boundary buses, run the same
+model again on just the subgraph, and penalize disagreement between the two
+predictions (see `core.utils.custom_losses.SubproblemConsistencyLoss`).
+
+Why folding in the tie-line flow like this is the right thing to do: for the
+*exact* AC power-flow solution, KCL at a bus n says
+
+    Pnet(n) = L(n) + shunt_consumed(n)
+
+where L(n) is the sum of the branch flows leaving n (in this codebase's
+convention, `p_fr`/`q_fr` for a branch where n is the "from" bus, `p_to`/
+`q_to` where n is the "to" bus -- see `CANOS_PF.derive_slack_output`, which
+scatter-adds both unnegated onto their own endpoint). Cutting a tie line t
+incident to a retained boundary bus b removes its contribution l_t(b) from
+L(b); the same voltage solution stays self-consistent at b only if we also
+subtract l_t(b) from Pnet(b) -- i.e. treat that removed flow as extra load
+at b. This is exact when l_t(b) is the true tie-line flow (a Ward/boundary
+equivalent); here we use the model's own predicted l_t(b) instead, which
+turns it into a self-training/pseudo-label signal that needs no ground
+truth on the target topology.
+"""
+
+from typing import Optional
+
+import torch
+from torch_geometric.data import Batch, HeteroData
+
+
+def _resolve_size(spec, reference_size: int) -> int:
+    """Turn a size spec into an absolute count, clamped to [1, reference_size].
+
+    A float < 1 is treated as a fraction of `reference_size`; anything else
+    is treated as an absolute count.
+    """
+    size = int(spec * reference_size) if isinstance(spec, float) and spec < 1 else int(spec)
+    return max(1, min(size, reference_size))
+
+
+def build_adjacency(edge_index: torch.Tensor, num_nodes: int) -> list:
+    """Build an undirected adjacency list from a directed branch edge_index."""
+    adjacency = [[] for _ in range(num_nodes)]
+    src = edge_index[0].tolist()
+    dst = edge_index[1].tolist()
+    for i, j in zip(src, dst):
+        adjacency[i].append(j)
+        adjacency[j].append(i)
+    return adjacency
+
+
+def sample_bus_subset(
+    adjacency: list,
+    seed_bus: int,
+    min_size,
+    max_size,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """
+    Randomly grow a connected subset of buses via BFS from `seed_bus`.
+
+    The subset is grown one shell at a time (each bus's unvisited neighbors,
+    in random order) until it reaches a target size sampled uniformly from
+    [min_size, max_size] (a bound given as a float < 1 is treated as a
+    fraction of the seed's connected-component size). Because it's built as
+    a BFS tree, the returned subset is always connected.
+
+    Parameters
+    ----------
+    adjacency : list[list[int]]
+        Undirected adjacency list, e.g. from `build_adjacency`. Can be over
+        a batched bus index space -- since batched samples never share
+        edges, growth from a seed inside one sample never crosses into
+        another.
+    seed_bus : int
+        Global bus index to grow the subset from.
+    min_size, max_size : int or float
+        Target subset size bounds (see `_resolve_size`).
+    generator : torch.Generator, optional
+        RNG used for the neighbor shuffle and size sampling.
+
+    Returns
+    -------
+    torch.Tensor
+        Sorted LongTensor of global bus indices in the sampled subset.
+    """
+    # First discover the seed's reachable component, so fractional size
+    # specs are relative to something meaningful.
+    visited = {seed_bus}
+    order = [seed_bus]
+    frontier = [seed_bus]
+    while frontier:
+        next_frontier = []
+        for node in frontier:
+            for neighbor in adjacency[node]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    order.append(neighbor)
+                    next_frontier.append(neighbor)
+        frontier = next_frontier
+    component_size = len(order)
+
+    lo = _resolve_size(min_size, component_size)
+    hi = _resolve_size(max_size, component_size)
+    lo, hi = min(lo, hi), max(lo, hi)
+    target_size = torch.randint(lo, hi + 1, (1,), generator=generator).item()
+
+    if target_size >= component_size:
+        return torch.tensor(sorted(visited), dtype=torch.long)
+
+    # Regrow the BFS, shuffling each shell, stopping once the target size is
+    # hit -- so repeated calls from the same seed still vary.
+    visited = {seed_bus}
+    kept = [seed_bus]
+    frontier = [seed_bus]
+    while frontier and len(kept) < target_size:
+        next_frontier = []
+        for node in frontier:
+            neighbors = adjacency[node]
+            perm = torch.randperm(len(neighbors), generator=generator).tolist()
+            for idx in perm:
+                neighbor = neighbors[idx]
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                kept.append(neighbor)
+                next_frontier.append(neighbor)
+                if len(kept) >= target_size:
+                    break
+            if len(kept) >= target_size:
+                break
+        frontier = next_frontier
+
+    return torch.tensor(sorted(kept), dtype=torch.long)
+
+
+def _remap_node_type(data, sub_data, node_type, link_name, keep_mask, new_index):
+    """
+    Filter a `node_type` node store (e.g. "gen"/"load") plus its
+    `(node_type, link_name, "bus")` link edges down to whichever entries
+    attach to a kept bus, remapping bus references to the new contiguous
+    local indices.
+    """
+    link_edge_index = data[node_type, link_name, "bus"].edge_index
+    node_idx, bus_idx = link_edge_index[0], link_edge_index[1]
+    keep = keep_mask[bus_idx]
+    kept_node_idx = node_idx[keep]
+    device = kept_node_idx.device
+
+    # Skip PyG's own batch bookkeeping keys -- "ptr" in particular is sized by
+    # num_graphs + 1, not by node count, so indexing it with kept_node_idx
+    # would be wrong (or out of bounds) rather than just redundant.
+    skip_keys = {"num_nodes", "ptr", "batch"}
+    for key, value in data[node_type].items():
+        if key in skip_keys or not torch.is_tensor(value):
+            continue
+        sub_data[node_type][key] = value[kept_node_idx]
+    # PyG can't reliably infer num_nodes for a node type with no canonical
+    # ("x"-like) attribute -- e.g. "gen"'s limits/generation/slack_gen -- and
+    # a sampled subgraph can easily end up with zero of them, so set it
+    # explicitly to keep later batching (e.g. in build_subproblem_batch) safe.
+    sub_data[node_type].num_nodes = kept_node_idx.numel()
+
+    new_link_index = torch.stack(
+        [
+            torch.arange(kept_node_idx.numel(), device=device),
+            new_index[bus_idx[keep]],
+        ]
+    )
+    sub_data[node_type, link_name, "bus"].edge_index = new_link_index
+    sub_data["bus", link_name, node_type].edge_index = new_link_index.flip(0)
+
+
+def build_subproblem(
+    data: HeteroData,
+    output_dict: dict,
+    bus_subset: torch.Tensor,
+    add_bus_type: Optional[bool] = None,
+    detach_teacher: bool = True,
+) -> tuple:
+    """
+    Cut a subgraph out of `data` restricted to `bus_subset`, folding the
+    model's own predicted tie-line flows into the retained boundary buses'
+    net power injection (see module docstring) so the result is a
+    self-consistent, standalone power-flow instance.
+
+    If the case's slack (reference) bus is not in `bus_subset`, a new local
+    slack is elected from within the subset -- preferring a PV bus, since a
+    PV bus's reactive generation is a genuine model prediction, so comparing
+    it downstream is a meaningful consistency check rather than one that
+    trivially matches an echoed input -- and pinned to the full-grid model's
+    own predicted (va, vm) there.
+
+    Works directly on a batched `data`/`output_dict`: `bus_subset` just
+    needs to be a subset of one sample's own (batch-offset) bus indices,
+    since node/edge stores outside it are automatically excluded. See
+    `build_subproblem_batch` for building one subproblem per sample in a
+    batch and re-batching them.
+
+    Parameters
+    ----------
+    data : HeteroData
+        The (optionally batched) full-grid input graph that produced
+        `output_dict`.
+    output_dict : dict
+        CANOS_PF-style output dict from a forward pass on `data` --
+        `output_dict["bus"]` (va, vm per bus) and `output_dict["edge_preds"]`
+        (p_fr, q_fr, p_to, q_to per branch) are used.
+    bus_subset : torch.Tensor
+        Global bus indices (into `data["bus"]`) to keep.
+    add_bus_type : bool, optional
+        Whether to also rebuild the PV/PQ/slack sub-node-types and their
+        link edges. Defaults to auto-detecting from whether `data` itself
+        has a "PQ" node type.
+    detach_teacher : bool
+        If True, every quantity taken from `output_dict`/`data` (tie-line
+        injections, the promoted slack's (va, vm)) is detached before being
+        used to build the subproblem, so gradients from the subsequent
+        subproblem forward pass don't flow back into the full-grid pass
+        that produced them.
+
+    Returns
+    -------
+    sub_data : HeteroData
+        The subproblem graph, ready to feed into the same model.
+    bus_map : torch.Tensor
+        `sub_data["bus"]` row i corresponds to global bus index `bus_map[i]`
+        in `data["bus"]`.
+    voltage_mask : torch.Tensor
+        Boolean mask, True for every `sub_data["bus"]` row whose predicted
+        (va, vm) is a genuine model prediction rather than an echoed input
+        (i.e. every row except a promoted local slack, if any).
+    edge_map : torch.Tensor
+        `sub_data["bus","branch","bus"]` column i corresponds to row
+        `edge_map[i]` of `data["bus","branch","bus"].edge_attr` /
+        `output_dict["edge_preds"]`.
+    """
+    if add_bus_type is None:
+        add_bus_type = "PQ" in data.node_types
+
+    maybe_detach = (lambda t: t.detach()) if detach_teacher else (lambda t: t)
+
+    device = data["bus"].x.device
+    num_buses = data["bus"].num_nodes
+    bus_subset = bus_subset.to(device=device, dtype=torch.long)
+    n_sub = bus_subset.numel()
+
+    keep_mask = torch.zeros(num_buses, dtype=torch.bool, device=device)
+    keep_mask[bus_subset] = True
+    new_index = torch.full((num_buses,), -1, dtype=torch.long, device=device)
+    new_index[bus_subset] = torch.arange(n_sub, device=device)
+
+    # ---- Branch edges: split into interior (both ends kept) and tie lines (one end kept) ----
+    edge_index = data["bus", "branch", "bus"].edge_index
+    edge_attr = data["bus", "branch", "bus"].edge_attr
+    src, dst = edge_index[0], edge_index[1]
+    src_in, dst_in = keep_mask[src], keep_mask[dst]
+    interior_mask = src_in & dst_in
+    tie_src_kept = src_in & ~dst_in  # tie line, retained endpoint is "from"
+    tie_dst_kept = dst_in & ~src_in  # tie line, retained endpoint is "to"
+
+    edge_preds = maybe_detach(output_dict["edge_preds"])
+    bus_pred = maybe_detach(output_dict["bus"])
+
+    # ---- Fold each cut tie-line's predicted flow into its retained endpoint's net injection ----
+    # `extra_p`/`extra_q`: real/reactive power that used to leave the bus along
+    # now-removed tie lines, per the full-grid model's own prediction (p_fr for
+    # a line where the retained bus is "from", p_to where it's "to" -- both
+    # unnegated, matching CANOS_PF.derive_slack_output's own convention).
+    # Pnet_new = Pnet_old - extra_p/extra_q, i.e. pd_new = pd_old + extra_p (see
+    # module docstring derivation).
+    extra_p = torch.zeros(num_buses, device=device)
+    extra_q = torch.zeros(num_buses, device=device)
+    extra_p.scatter_add_(0, src[tie_src_kept], edge_preds[tie_src_kept, 0])
+    extra_q.scatter_add_(0, src[tie_src_kept], edge_preds[tie_src_kept, 1])
+    extra_p.scatter_add_(0, dst[tie_dst_kept], edge_preds[tie_dst_kept, 2])
+    extra_q.scatter_add_(0, dst[tie_dst_kept], edge_preds[tie_dst_kept, 3])
+
+    bus_type = data["bus"].bus_type[bus_subset].clone()
+    bus_demand = data["bus"].bus_demand[bus_subset].clone()
+    bus_gen = data["bus"].bus_gen[bus_subset].clone()
+    bus_voltages = data["bus"].bus_voltages[bus_subset].clone()
+    bus_shunts = data["bus"].shunt[bus_subset].clone()
+    voltage_limits = data["bus"].limits[bus_subset].clone()
+
+    bus_demand[:, 0] = bus_demand[:, 0] + extra_p[bus_subset]
+    bus_demand[:, 1] = bus_demand[:, 1] + extra_q[bus_subset]
+
+    # ---- Elect a new local slack if the case's own slack bus fell outside the subset ----
+    global_slack_idx = (data["bus"].bus_type == 3).nonzero(as_tuple=True)[0]
+    slack_kept = bool(keep_mask[global_slack_idx].any())
+    voltage_mask = torch.ones(n_sub, dtype=torch.bool, device=device)
+
+    new_src = new_index[src[interior_mask]]
+    new_dst = new_index[dst[interior_mask]]
+
+    if not slack_kept:
+        degree = torch.zeros(n_sub, device=device)
+        degree.scatter_add_(0, new_src, torch.ones_like(new_src, dtype=torch.float))
+        degree.scatter_add_(0, new_dst, torch.ones_like(new_dst, dtype=torch.float))
+
+        pv_positions = (bus_type == 2).nonzero(as_tuple=True)[0]
+        if pv_positions.numel() > 0:
+            promote_pos = pv_positions[degree[pv_positions].argmax()].item()
+        else:
+            promote_pos = int(degree.argmax().item())
+
+        bus_type[promote_pos] = 3
+        bus_voltages[promote_pos] = bus_pred[bus_subset[promote_pos]]
+        voltage_mask[promote_pos] = False
+
+    pq_mask = bus_type == 1
+    pv_mask = bus_type == 2
+    slack_mask = bus_type == 3
+
+    pf_x = torch.zeros(n_sub, 2, device=device)
+    pf_x[pq_mask] = bus_demand[pq_mask]
+    pf_x[pv_mask, 0] = bus_gen[pv_mask, 0] - bus_demand[pv_mask, 0]
+    pf_x[pv_mask, 1] = bus_voltages[pv_mask, 1]
+    pf_x[slack_mask] = bus_voltages[slack_mask]
+
+    sub_data = HeteroData()
+    sub_data["bus"].x = pf_x
+    sub_data["bus"].num_nodes = n_sub
+    sub_data["bus"].bus_gen = bus_gen
+    sub_data["bus"].bus_demand = bus_demand
+    sub_data["bus"].bus_voltages = bus_voltages
+    sub_data["bus"].bus_type = bus_type
+    sub_data["bus"].shunt = bus_shunts
+    sub_data["bus"].limits = voltage_limits
+
+    sub_data["bus", "branch", "bus"].edge_index = torch.stack([new_src, new_dst])
+    sub_data["bus", "branch", "bus"].edge_attr = edge_attr[interior_mask]
+    if "edge_limits" in data["bus", "branch", "bus"]:
+        sub_data["bus", "branch", "bus"].edge_limits = data[
+            "bus", "branch", "bus"
+        ].edge_limits[interior_mask]
+    edge_map = interior_mask.nonzero(as_tuple=True)[0]
+
+    # "gen"/"load" only exist for dataset variants that don't prune them --
+    # CANOS's own dataset (PFDeltaCANOS.build_heterodata) drops both, keeping
+    # only bus/PV/PQ/slack, so there's nothing to remap for the common case.
+    if "gen" in data.node_types:
+        _remap_node_type(data, sub_data, "gen", "gen_link", keep_mask, new_index)
+    if "load" in data.node_types:
+        _remap_node_type(data, sub_data, "load", "load_link", keep_mask, new_index)
+
+    if add_bus_type:
+        for node_type, mask in (("PQ", pq_mask), ("PV", pv_mask), ("slack", slack_mask)):
+            positions = mask.nonzero(as_tuple=True)[0]
+            sub_data[node_type].x = pf_x[positions]
+            if node_type != "PQ":
+                sub_data[node_type].demand = bus_demand[positions]
+                sub_data[node_type].generation = bus_gen[positions]
+            link_index = torch.stack(
+                [torch.arange(positions.numel(), device=device), positions]
+            )
+            sub_data[node_type, f"{node_type}_link", "bus"].edge_index = link_index
+            sub_data["bus", f"{node_type}_link", node_type].edge_index = link_index.flip(0)
+
+    bus_map = bus_subset.clone()
+    return sub_data, bus_map, voltage_mask, edge_map
+
+
+def build_subproblem_batch(
+    data,
+    output_dict: dict,
+    min_size=0.1,
+    max_size=0.3,
+    add_bus_type: Optional[bool] = None,
+    detach_teacher: bool = True,
+    generator: Optional[torch.Generator] = None,
+) -> tuple:
+    """
+    Apply `build_subproblem` once per sample in a batched `data`, sampling an
+    independent random connected bus subset per sample, and re-batch the
+    results into a single HeteroData batch ready for another forward pass.
+
+    Returns the same four outputs as `build_subproblem`, concatenated across
+    the batch in sample order -- which is also the order `Batch.from_data_
+    list` lays each sample's nodes/edges out in, so `bus_map`/`voltage_mask`/
+    `edge_map` can be indexed directly against a subsequent forward pass on
+    the returned `sub_data`.
+
+    Parameters
+    ----------
+    data : HeteroData or Batch
+        Batched full-grid input that produced `output_dict`.
+    output_dict : dict
+        See `build_subproblem`.
+    min_size, max_size : int or float
+        Per-sample subgraph size bounds, passed to `sample_bus_subset`
+        (fractions of each sample's own bus count if < 1).
+    add_bus_type : bool, optional
+        See `build_subproblem`.
+    detach_teacher : bool
+        See `build_subproblem`.
+    generator : torch.Generator, optional
+        RNG for reproducible sampling.
+
+    Returns
+    -------
+    sub_data : Batch
+    bus_map, voltage_mask, edge_map : torch.Tensor
+        Concatenated across the batch; see `build_subproblem`.
+    """
+    bus_store = data["bus"]
+    device = bus_store.x.device
+    num_buses = bus_store.num_nodes
+    ptr = bus_store.ptr if "ptr" in bus_store else torch.tensor([0, num_buses], device=device)
+
+    adjacency = build_adjacency(data["bus", "branch", "bus"].edge_index, num_buses)
+
+    sub_data_list, bus_maps, voltage_masks, edge_maps = [], [], [], []
+    for k in range(ptr.numel() - 1):
+        lo, hi = int(ptr[k].item()), int(ptr[k + 1].item())
+        if hi <= lo:
+            continue
+        seed_bus = torch.randint(lo, hi, (1,), generator=generator).item()
+        bus_subset = sample_bus_subset(
+            adjacency, seed_bus, min_size, max_size, generator=generator
+        )
+        sub_data, bus_map, voltage_mask, edge_map = build_subproblem(
+            data,
+            output_dict,
+            bus_subset,
+            add_bus_type=add_bus_type,
+            detach_teacher=detach_teacher,
+        )
+        sub_data_list.append(sub_data)
+        bus_maps.append(bus_map)
+        voltage_masks.append(voltage_mask)
+        edge_maps.append(edge_map)
+
+    sub_data_batch = Batch.from_data_list(sub_data_list)
+    bus_map_all = torch.cat(bus_maps)
+    voltage_mask_all = torch.cat(voltage_masks)
+    edge_map_all = torch.cat(edge_maps)
+
+    return sub_data_batch, bus_map_all, voltage_mask_all, edge_map_all

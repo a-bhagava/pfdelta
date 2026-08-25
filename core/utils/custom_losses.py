@@ -2,10 +2,12 @@ import types
 
 import torch
 from torch import nn
+from torch.nn.functional import mse_loss
 from torch_geometric.data import HeteroData
 
 from core.utils.registry import registry
 from core.utils.pf_losses_utils import PowerBalanceLoss
+from core.utils.create_subproblem import build_subproblem_batch
 
 
 def loss_loader(class_name, class_inputs, class_type):
@@ -99,6 +101,107 @@ class CombinedLoss:
         loss2 = self.loss2(predictions, labels)
         weighted_loss = loss1 + self.lamb * loss2
         return weighted_loss
+
+
+@registry.register_loss("subproblem_consistency")
+class SubproblemConsistencyLoss:
+    """
+    Self-consistency train-time augmentation loss for topology transfer
+    (PFDelta task 3.1). Cuts a random connected subgraph out of each sample
+    in the batch, folds the full-grid model's own predicted tie-line flows
+    into the boundary buses' net injection (see
+    `core.utils.create_subproblem`), runs the same model again on the
+    subgraph, and penalizes disagreement between the two predictions: bus
+    voltages, net bus injections, and interior branch flows. Needs no
+    ground truth on the target topology -- only the model's own full-grid
+    prediction, which is why this is CANOS_PF-specific (relies on its
+    output_dict schema and its bus/PV/PQ/slack HeteroData layout).
+
+    `self.model` must be set after construction -- the owning trainer is
+    responsible for that (mirroring `recycle_loss`'s `.source` injection),
+    since a live `nn.Module` can't be built from plain config kwargs. See
+    `core.trainers.subgraph_finetune_trainer.SubgraphFinetuneTrainer`.
+    """
+
+    def __init__(
+        self,
+        min_size=0.1,
+        max_size=0.3,
+        detach_teacher=True,
+        voltage_weight=1.0,
+        injection_weight=1.0,
+        edge_weight=1.0,
+        seed=None,
+    ):
+        self.model = None
+        self.min_size = min_size
+        self.max_size = max_size
+        self.detach_teacher = detach_teacher
+        self.voltage_weight = voltage_weight
+        self.injection_weight = injection_weight
+        self.edge_weight = edge_weight
+        self.generator = (
+            torch.Generator().manual_seed(seed) if seed is not None else None
+        )
+        # Only used here for its collect_model_predictions helper (gathers
+        # per-bus net P/Q injection, handling PQ/PV/slack uniformly).
+        self._pbl = PowerBalanceLoss(model="CANOS")
+        self.loss_name = "Subproblem consistency"
+
+    def __call__(self, outputs, data):
+        assert self.model is not None, (
+            "SubproblemConsistencyLoss.model was never set -- the owning "
+            "trainer needs to inject it after building the model (see "
+            "SubgraphFinetuneTrainer.modify_loss)."
+        )
+
+        sub_data, bus_map, voltage_mask, edge_map = build_subproblem_batch(
+            data,
+            outputs,
+            min_size=self.min_size,
+            max_size=self.max_size,
+            detach_teacher=self.detach_teacher,
+            generator=self.generator,
+        )
+        sub_outputs = self.model(sub_data)
+
+        # Bus voltages: skip any promoted local-slack rows, since their (va, vm)
+        # is an echoed input on the subproblem side, not a prediction.
+        teacher_bus = outputs["bus"][bus_map][voltage_mask]
+        student_bus = sub_outputs["bus"][voltage_mask]
+        if self.detach_teacher:
+            teacher_bus = teacher_bus.detach()
+        self.voltage_loss = mse_loss(student_bus, teacher_bus)
+
+        # Net bus injections (P, Q). A genuine prediction on either side whenever
+        # that bus is PV/slack there; a harmless (~0) echoed-input term when both
+        # sides see it as PQ.
+        teacher_preds = self._pbl.collect_model_predictions("CANOS", data, outputs)
+        student_preds = self._pbl.collect_model_predictions("CANOS", sub_data, sub_outputs)
+        _, _, Pnet_t, Qnet_t = teacher_preds["predictions"]
+        _, _, Pnet_s, Qnet_s = student_preds["predictions"]
+        teacher_net = torch.stack([Pnet_t[bus_map], Qnet_t[bus_map]], dim=-1)
+        student_net = torch.stack([Pnet_s, Qnet_s], dim=-1)
+        if self.detach_teacher:
+            teacher_net = teacher_net.detach()
+        self.injection_loss = mse_loss(student_net, teacher_net)
+
+        # Interior branch flows (lines kept on both sides of the cut).
+        teacher_edges = outputs["edge_preds"][edge_map]
+        student_edges = sub_outputs["edge_preds"]
+        if self.detach_teacher:
+            teacher_edges = teacher_edges.detach()
+        self.edge_loss = (
+            mse_loss(student_edges, teacher_edges)
+            if student_edges.numel() > 0
+            else torch.zeros((), device=student_bus.device)
+        )
+
+        return (
+            self.voltage_weight * self.voltage_loss
+            + self.injection_weight * self.injection_loss
+            + self.edge_weight * self.edge_loss
+        )
 
 
 @registry.register_loss("Objective_n_Penalty")

@@ -1,0 +1,86 @@
+config_type: experiment
+# Subgraph-consistency finetuning for topology transfer (PFDelta task 3.1).
+# Warm-starts from a model already trained on `source_case` (e.g. via
+# canos_task_1_3.yaml) and finetunes on a handful of labelled samples from
+# `target_case`, augmented by the self-consistency loss in
+# core/utils/custom_losses.py::SubproblemConsistencyLoss: it predicts on the
+# full target-case grid, cuts a random connected subgraph out of it, folds
+# the removed tie-lines' predicted flows into the boundary buses as extra
+# injection, solves the subgraph, and penalizes disagreement with the
+# full-grid prediction. See core/utils/create_subproblem.py for the details.
+dataset:
+  datasets:
+  - add_bus_type: true
+    case_name: case118  # TODO: set to the target case_name you're transferring to
+    model: CANOS
+    name: pfdeltaCANOS
+    root_dir: data/pfdelta_data  # TODO: update root_dir if needed
+    split: train
+    task: 1.3
+  - add_bus_type: true
+    case_name: case118  # TODO: same target case_name as above
+    model: CANOS
+    name: pfdeltaCANOS
+    root_dir: data/pfdelta_data  # TODO: update root_dir if needed
+    split: val
+    task: 1.3
+functional:
+  run_location: canos_task_3_1_finetune
+  run_name: canos_k_steps20_hd128_lr5e-5_task_3_1_finetune
+  is_debug: false
+  seed: 11
+  cpu: false
+  trainer_name: subgraph_finetune_trainer
+model:
+  dataset: _include_
+  hidden_dim: 128
+  include_sent_messages: true
+  k_steps: 20
+  name: canos_pf
+  # TODO: point this at the model.pt saved by the run being finetuned (e.g.
+  # runs/canos_task_1_3/<run_name>/model.pt, trained on the *source* case).
+  pretrained_path: runs/canos_task_1_3/CHANGE_ME/model.pt
+optim:
+  optimizer:
+    lr: 0.00005  # finetuning: an order of magnitude below the from-scratch LR
+    name: Adam
+    weight_decay: 0.0
+  train_params:
+    batch_size: 32
+    epochs: 30
+    train_loss:
+    - name: combined_loss
+      # loss1: the model's usual supervised + physics objective on the (few)
+      # labelled target-case samples.
+      loss1: combined_loss
+      inp1:
+        loss1: canos_pf_mse
+        loss2: pf_constraint_violation
+        lamb: 0.1
+      # loss2: the label-free subgraph self-consistency term.
+      loss2: subproblem_consistency
+      inp2:
+        min_size: 0.1
+        max_size: 0.3
+        detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
+                               # false for symmetric/joint gradients instead
+        voltage_weight: 1.0
+        injection_weight: 1.0
+        edge_weight: 1.0
+      lamb: 0.05  # weight of the consistency term relative to the supervised one
+    - model: CANOS
+      name: universal_power_balance
+  val_params:
+    batch_size: 32
+    early_stop:
+      decrease_by: 0.01
+      decrease_for: 10
+      needs_best_every: 15
+    report_every: 1
+    val_loss:
+    - lamb: 0.1
+      loss1: canos_pf_mse
+      loss2: pf_constraint_violation
+      name: combined_loss
+    - model: CANOS
+      name: universal_power_balance
