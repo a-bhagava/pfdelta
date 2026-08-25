@@ -463,9 +463,11 @@ def connected_list_expansion(inputs, current_dict):
         names = [names[i] for names in connected_names]
         values.reverse()
         new_dict = current_dict
-        for key, value, name, start, end in zip(
-            connected_keys, values, names, starts, ends
-        ):
+        # Substitute every connected-list occurrence's value first, strictly
+        # back-to-front (starts/ends are reversed above), so each remaining
+        # offset -- computed once from the original, unmodified string --
+        # stays valid as the string shrinks with each substitution.
+        for value, start, end in zip(values, starts, ends):
             # Check if it is intended to be a string
             if parse_value(value) == value:
                 value = '"' + value + '"'
@@ -474,18 +476,19 @@ def connected_list_expansion(inputs, current_dict):
             start_of_dict = new_dict[: start - 1]
             end_of_dict = new_dict[end + 2 :]
             new_dict = start_of_dict + value + end_of_dict
-            # We modify run name if necessary
-            run_name_idx = new_dict.find("run_name")
-            if run_name_idx != -1:
-                # Gather run name
-                run_name_start = run_name_idx + 12
-                run_name_end = new_dict.find('"', run_name_start)
-                run_name = new_dict[run_name_start:run_name_end]
-                # Compute new run name
-                new_run_name = run_name.replace(f"%{key}", name)
-                new_dict = (
-                    new_dict[:run_name_start] + new_run_name + new_dict[run_name_end:]
-                )
+        # Only now that the string is done shrinking, substitute run_name's
+        # %key placeholders -- doing this earlier (interleaved with the loop
+        # above, as this used to) would shift the positions of any
+        # not-yet-processed connected-list occurrence that sits after
+        # run_name in the config, corrupting the result.
+        run_name_idx = new_dict.find("run_name")
+        if run_name_idx != -1:
+            run_name_start = run_name_idx + 12
+            run_name_end = new_dict.find('"', run_name_start)
+            run_name = new_dict[run_name_start:run_name_end]
+            for key, name in zip(connected_keys, names):
+                run_name = run_name.replace(f"%{key}", name)
+            new_dict = new_dict[:run_name_start] + run_name + new_dict[run_name_end:]
         new_dicts.append(new_dict)
 
     return new_dicts

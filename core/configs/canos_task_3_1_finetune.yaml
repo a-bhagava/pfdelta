@@ -40,7 +40,15 @@ dataset:
     split: train
     task: 1.3
   - add_bus_type: true
-    case_name: case118
+    # First-listed val dataset -- this is the one early_stop_now/is_new_best
+    # actually use (see val_params.use_first_only below and
+    # BaseTrainer.interpret_val_performance), so tying its case to the same
+    # sgband key as min_size/max_size makes early stopping/best-model
+    # selection follow whichever case matches each job's size band. The
+    # "wide" band doesn't target one case, so it repeats case118 here --
+    # doesn't matter which, since use_first_only=false for that band means
+    # this entry is just averaged in with everyone else, not singled out.
+    case_name: _connected_list(sgband -- case14, case30, case57, case118, case118 | 14, 30, 57, 118, wide)
     model: CANOS
     name: pfdeltaCANOS
     root_dir: /orcd/pool/005/donti_shared/pfdelta_data
@@ -76,7 +84,7 @@ dataset:
     task: 1.3
 functional:
   run_location: canos_task_3_1_finetune
-  run_name: canos_k_steps15_hd256_lr1e-4_sg_size%min_size_cons_lam_%lamb_task_3_1_finetune
+  run_name: canos_k_steps15_hd256_lr1e-4_sgband_%sgband_cons_lam_%lamb_task_3_1_finetune
   is_debug: false
   seed: 11
   cpu: false
@@ -103,14 +111,20 @@ optim:
         model: CANOS
       loss2: subproblem_consistency
       inp2:
-        min_size: _manual_list(10, 50, 100 | 10, 50, 100)  # absolute bus counts (>=1 => not treated as a fraction),
-        max_size: 136  # a band around case118's ~118 buses for some augmentation diversity
+        # min_size/max_size vary together (paired, not cross-producted) across
+        # five size bands -- four tight ones roughly matching case14/case30/
+        # case57/case118, plus a "wide" band spanning that whole range (case14
+        # through case118) to test whether training on diverse subgraph sizes
+        # transfers better overall than specializing to one target size. 5
+        # runs from this pair (not 25), since they share the "sgband" key.
+        min_size: _connected_list(sgband -- 10, 24, 48, 100, 10 | 14, 30, 57, 118, wide)
+        max_size: _connected_list(sgband -- 18, 36, 66, 136, 136 | 14, 30, 57, 118, wide)
         detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
                                # false for symmetric/joint gradients instead
         voltage_weight: 1.0
         injection_weight: 1.0
         edge_weight: 1.0
-      lamb: _manual_list(0.05, 0.1 | 0.05, 0.1)  # weight of the consistency term relative to the supervised one
+      lamb: _manual_list(0.01, 0.1 | 0.01, 0.1)  # weight of the consistency term relative to the supervised one
     # Logged only (see SubgraphFinetuneTrainer._wire_recycle_losses) -- pulls
     # the already-computed subtotals off train_loss[0] above for free, no
     # extra forward pass, so train.json shows both components alongside the
@@ -130,6 +144,12 @@ optim:
       name: combined_loss
   val_params:
     batch_size: 64
+    # True (the 4 targeted bands): early stopping/best-model follows only the
+    # first-listed val dataset (dataset.datasets[1], tied to case_name above).
+    # False (the "wide" band): no single target case makes sense, so it
+    # averages the leading val_loss (PBL Mean) across ALL val datasets
+    # instead (see BaseTrainer.interpret_val_performance).
+    use_first_only: _connected_list(sgband -- true, true, true, true, false | 14, 30, 57, 118, wide)
     early_stop:
       decrease_by: 0.01
       decrease_for: 20
