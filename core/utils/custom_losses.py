@@ -100,6 +100,10 @@ class CombinedLoss:
         loss1 = self.loss1(predictions, labels)
         loss2 = self.loss2(predictions, labels)
         weighted_loss = loss1 + self.lamb * loss2
+        # Cached so a `recycle_loss` entry can report this subtotal (e.g. for
+        # a nested combined_loss) without recomputing it -- see e.g.
+        # SubgraphFinetuneTrainer._wire_recycle_losses.
+        self.loss = weighted_loss
         return weighted_loss
 
 
@@ -197,11 +201,12 @@ class SubproblemConsistencyLoss:
             else torch.zeros((), device=student_bus.device)
         )
 
-        return (
+        self.loss = (
             self.voltage_weight * self.voltage_loss
             + self.injection_weight * self.injection_loss
             + self.edge_weight * self.edge_loss
         )
+        return self.loss
 
 
 @registry.register_loss("Objective_n_Penalty")

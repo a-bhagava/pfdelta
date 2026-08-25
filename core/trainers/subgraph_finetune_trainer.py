@@ -1,7 +1,7 @@
 import torch
 
 from core.trainers.gnn_trainer import GNNTrainer
-from core.utils.custom_losses import CombinedLoss, SubproblemConsistencyLoss
+from core.utils.custom_losses import CombinedLoss, RecycleLoss, SubproblemConsistencyLoss
 from core.utils.registry import registry
 
 
@@ -33,7 +33,60 @@ class SubgraphFinetuneTrainer(GNNTrainer):
        from scratch), the model can be warm-started from a previously
        trained run's weights via `model.pretrained_path` in the config
        (a path to a `model.pt`/state_dict file).
+
+    3. Before any finetuning step, it runs one validation pass over all val
+       datasets with the just-warm-started model, so you have a baseline to
+       compare the finetuned numbers against (recorded under val_errors key
+       "-1", printed same as any other validation, saved to val.json). This
+       is skipped when resuming from a checkpoint, since a baseline was
+       already recorded on the original run.
+
+    4. If `train_loss[0]` is built the way the docstring above shows --
+       `combined_loss(loss1=<supervised combined_loss>, loss2=subproblem_
+       consistency)` -- this wires any `recycle_loss` entries elsewhere in
+       `train_loss` with `keyword: finetune_supervised` /
+       `keyword: finetune_consistency` to that supervised subtotal /
+       consistency subtotal respectively, so train.json can report both
+       components plus the combined total (train_loss[0] itself) without
+       recomputing anything twice, e.g.:
+
+           train_loss:
+           - name: combined_loss          # index 0: backpropagated total
+             ...
+           - name: recycle_loss           # logged only: supervised subtotal
+             recycled_parameter: loss
+             loss_name: "Supervised subtotal"
+             keyword: finetune_supervised
+           - name: recycle_loss           # logged only: consistency subtotal
+             recycled_parameter: loss
+             loss_name: "Consistency subtotal"
+             keyword: finetune_consistency
     """
+
+    def train(self):
+        self._evaluate_pretrained_baseline()
+        super().train()
+
+    def _evaluate_pretrained_baseline(self):
+        if self.checkpoint and self._checkpoint_used:
+            # Resuming a finetuning run that already has its own baseline
+            # entry -- don't re-evaluate (and don't touch self.epoch mid-resume).
+            return
+        print(
+            "\n\U0001f50d Evaluating the pretrained/warm-started model on all "
+            "validation sets before any finetuning step (baseline)..."
+        )
+        train_params = self.config["optim"]["train_params"]
+        # calc_val_errors keys its entry off self.epoch when max_epoch is set
+        # (see BaseTrainer.calc_val_errors) -- set both up the same way
+        # BaseTrainer._train does, but with epoch=-1, so this baseline gets
+        # its own distinct key instead of colliding with epoch 0's real
+        # post-training validation.
+        self.max_epoch = train_params.get("epochs", self.max_epoch)
+        saved_epoch = self.epoch
+        self.epoch = -1
+        self.calc_val_errors()
+        self.epoch = saved_epoch
 
     def customize_model_init_inputs(self, model_inputs):
         super().customize_model_init_inputs(model_inputs)
@@ -52,6 +105,7 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         super().modify_loss()
         for loss in list(self.train_loss) + list(self.val_loss):
             self._wire_subproblem_loss(loss)
+        self._wire_recycle_losses()
 
     def _wire_subproblem_loss(self, loss):
         if isinstance(loss, SubproblemConsistencyLoss):
@@ -59,3 +113,18 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         elif isinstance(loss, CombinedLoss):
             self._wire_subproblem_loss(loss.loss1)
             self._wire_subproblem_loss(loss.loss2)
+
+    def _wire_recycle_losses(self):
+        # Only applies to the train_loss[0] == combined_loss(supervised,
+        # subproblem_consistency) shape shown in the docstring above --
+        # anything else, there's nothing we know how to wire, so skip quietly.
+        if not self.train_loss or not isinstance(self.train_loss[0], CombinedLoss):
+            return
+        outer = self.train_loss[0]
+        for loss in list(self.train_loss) + list(self.val_loss):
+            if not isinstance(loss, RecycleLoss):
+                continue
+            if loss.keyword == "finetune_supervised":
+                loss.source = outer.loss1
+            elif loss.keyword == "finetune_consistency":
+                loss.source = outer.loss2
