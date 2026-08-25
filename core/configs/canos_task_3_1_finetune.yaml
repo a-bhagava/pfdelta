@@ -1,24 +1,34 @@
 config_type: experiment
 # Subgraph-consistency finetuning for topology transfer (PFDelta task 3.1).
-# Warm-starts from a model already trained on `source_case` (e.g. via
-# canos_task_1_3.yaml) and finetunes on a handful of labelled samples from
-# `target_case`, augmented by the self-consistency loss in
-# core/utils/custom_losses.py::SubproblemConsistencyLoss: it predicts on the
-# full target-case grid, cuts a random connected subgraph out of it, folds
-# the removed tie-lines' predicted flows into the boundary buses as extra
-# injection, solves the subgraph, and penalizes disagreement with the
-# full-grid prediction. See core/utils/create_subproblem.py for the details.
+#
+# Scenario: CANOS trained on case500 (e.g. via canos_task_1_3.yaml with
+# case_name: case500) generalizes poorly to case118. This does NOT train on
+# any case118 data -- it warm-starts from that case500 checkpoint and keeps
+# training on case500's own train split, with one addition: alongside the
+# usual supervised + physics objective (combined canos_pf_mse +
+# pf_constraint_violation, matching canos_task_1_3.yaml), a self-consistency
+# term from core/utils/custom_losses.py::SubproblemConsistencyLoss samples
+# ~118-bus subgraphs out of the (much bigger) case500 grid, folds the cut
+# tie-lines' predicted flows into the boundary buses as extra injection,
+# solves the subgraph, and penalizes disagreement with the full case500
+# prediction -- teaching the model to be self-consistent at ~case118 scale
+# using only case500 data. See core/utils/create_subproblem.py for the
+# mechanics.
+#
+# case118 only appears below as a validation set, purely to monitor whether
+# this is actually closing the transfer gap -- val_loss is never
+# backpropagated (see GNNTrainer: only train_loss[0] gets .backward()).
 dataset:
   datasets:
   - add_bus_type: true
-    case_name: case118  # TODO: set to the target case_name you're transferring to
+    case_name: case500  # the only source of training data (source case)
     model: CANOS
     name: pfdeltaCANOS
     root_dir: data/pfdelta_data  # TODO: update root_dir if needed
     split: train
     task: 1.3
   - add_bus_type: true
-    case_name: case118  # TODO: same target case_name as above
+    case_name: case118  # transfer target -- monitoring only, never trained on
     model: CANOS
     name: pfdeltaCANOS
     root_dir: data/pfdelta_data  # TODO: update root_dir if needed
@@ -37,8 +47,8 @@ model:
   include_sent_messages: true
   k_steps: 20
   name: canos_pf
-  # TODO: point this at the model.pt saved by the run being finetuned (e.g.
-  # runs/canos_task_1_3/<run_name>/model.pt, trained on the *source* case).
+  # TODO: point this at the model.pt from your existing case500 run (the one
+  # trained via canos_task_1_3.yaml with case_name: case500).
   pretrained_path: runs/canos_task_1_3/CHANGE_ME/model.pt
 optim:
   optimizer:
@@ -50,18 +60,18 @@ optim:
     epochs: 30
     train_loss:
     - name: combined_loss
-      # loss1: the model's usual supervised + physics objective on the (few)
-      # labelled target-case samples.
+      # loss1: exactly canos_task_1_3.yaml's objective, still on case500.
       loss1: combined_loss
       inp1:
         loss1: canos_pf_mse
         loss2: pf_constraint_violation
         lamb: 0.1
-      # loss2: the label-free subgraph self-consistency term.
+      # loss2: the added subgraph self-consistency term, sampling case118-sized
+      # subgraphs out of case500 (see min_size/max_size below).
       loss2: subproblem_consistency
       inp2:
-        min_size: 0.1
-        max_size: 0.3
+        min_size: 100  # absolute bus counts (>=1 => not treated as a fraction),
+        max_size: 136  # a band around case118's ~118 buses for some augmentation diversity
         detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
                                # false for symmetric/joint gradients instead
         voltage_weight: 1.0
