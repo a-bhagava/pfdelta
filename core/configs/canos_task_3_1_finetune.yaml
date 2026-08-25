@@ -3,11 +3,13 @@ job_parameters:
   # SLURM has no "either GPU type" flag: --gres is an AND list (comma means
   # "give me all of these"), and --constraint only matches node Features,
   # not Gres types (hence "Invalid feature specification" -- l40s/h200 are
-  # registered as Gres here, not Features). So this doubles every job into
-  # two separate submissions instead -- one per (partition, gres) pairing --
-  # and lets SLURM start whichever gets a free slot first.
-  p: _connected_list(gputype -- mit_normal_gpu, mit_preemptable, pi_donti_gpu | l40s, l40s, h200)
-  gres: _connected_list(gputype -- gpu:l40s:1, gpu:l40s:1,, gpu:h200:1 | l40s, l40s, h200)
+  # registered as Gres here, not Features). Tied to the same "sgband" key as
+  # min_size/max_size/case_name/use_first_only below (not a separate key --
+  # that would cross-product into more jobs, not just route the existing
+  # ones) so each of the 10 jobs (5 bands x 2 lamb) gets routed to one pool,
+  # no duplication: 14/30/57 -> l40s, 118/wide -> h200.
+  p: _connected_list(sgband -- mit_normal_gpu, mit_preemptable, mit_preemptable, pi_donti_gpu, pi_donti_gpu | l40s, l40s, l40s, h200, h200)
+  gres: _connected_list(sgband -- gpu:l40s:1, gpu:l40s:1, gpu:l40s:1, gpu:h200:1, gpu:h200:1 | l40s, l40s, l40s, h200, h200)
   requeue: __novalue__
   body: "source ~/.bashrc\nconda activate pfdelta2\nexec __launch__"
   mem: 64G
