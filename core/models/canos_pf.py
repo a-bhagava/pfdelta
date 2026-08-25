@@ -107,7 +107,7 @@ class CANOS_PF(nn.Module):
             - output_dict["casename"] : str
               Case name for the dataset (copied from `dataset.case_name`).
         """
-        # Encoding
+        # Encodings
         projected_nodes, projected_edges = self.encoder(data)
 
         # Message passing layers with residual connections

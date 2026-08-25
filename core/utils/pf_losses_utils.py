@@ -78,19 +78,30 @@ class PowerBalanceLoss:
             src,
             dst,  # line connections
         )
+
+        # NOTE: set slack values to 0 to fix the
+        slack_idx = data["slack", "slack_link", "bus"].edge_index[1]
+        delta_P = delta_P.clone()
+        delta_Q = delta_Q.clone()
+        delta_P[slack_idx] = 0
+        delta_Q[slack_idx] = 0
+
         self.delta_P, self.delta_Q = delta_P, delta_Q
 
         # 4. Use complex mismatch to calculate PBL losses
 
         # Calculate PBL Mean
         delta_PQ_2 = delta_P**2 + delta_Q**2
-        delta_PQ_magn = torch.sqrt(delta_PQ_2)
+        # delta_PQ_magn = torch.sqrt(delta_PQ_2)
+        delta_PQ_magn = torch.sqrt(delta_PQ_2 + 1e-12)
         batch_idx = data["bus"].batch
         delta_PQ_magn_per_batch = global_mean_pool(delta_PQ_magn, batch_idx)
         self.power_balance_mean = delta_PQ_magn_per_batch.mean()
 
+
         # Calculate PBL L2
-        batched_power_balance_l2 = torch.sqrt(global_add_pool(delta_PQ_2, batch_idx))
+        batched_power_balance_l2 = torch.sqrt(global_add_pool(delta_PQ_2, batch_idx) + 1e-12)
+        # batched_power_balance_l2 = torch.sqrt(global_add_pool(delta_PQ_2, batch_idx))
         self.power_balance_l2 = batched_power_balance_l2.mean()
 
         # Calculate PBL Max
@@ -715,3 +726,7 @@ class CANOS_PF_MSE:
         self.loss = total_loss
 
         return total_loss
+
+
+#TODO: implement consistency loss
+#TODO: implement combined loss with PBL
