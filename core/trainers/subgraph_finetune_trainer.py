@@ -88,18 +88,28 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         self.epoch = -1
         # calc_val_errors() also calls save_summary(), which (in epochs mode)
         # unconditionally looks up self.train_errors[self.best_point] -- give
-        # it a harmless empty placeholder, since no training epoch has run
-        # yet to populate a real one. And skip save_checkpoint() for this one
-        # call (if checkpointing is on), since it would otherwise capture
-        # this synthetic epoch=-1 into the checkpoint.
-        self.train_errors["-1"] = {}
+        # it a NaN-filled placeholder (one entry per real train_loss_names
+        # key, matching what report_results() would normally produce), since
+        # no training epoch has run yet to populate a real one. This has to
+        # stay (not just for this one call): self.best_point remains "-1"
+        # until some real epoch actually beats the baseline, and every
+        # save_summary()/print_summary() call until then -- including the
+        # very last one, if finetuning never beats the baseline at all --
+        # does this same lookup by key name, so deleting it (or leaving it
+        # empty) would just move a KeyError to a later call instead of
+        # fixing it. Shows up as a harmless all-NaN "-1" entry in train.json.
+        self.train_errors.setdefault(
+            "-1", {name: float("nan") for name in self.train_loss_names}
+        )
+        # Skip save_checkpoint() for this one call (if checkpointing is on),
+        # since it would otherwise capture this synthetic epoch=-1 into the
+        # checkpoint.
         self.checkpoint = False
         try:
             self.calc_val_errors()
         finally:
             self.checkpoint = saved_checkpoint
             self.epoch = saved_epoch
-            del self.train_errors["-1"]
 
     def customize_model_init_inputs(self, model_inputs):
         super().customize_model_init_inputs(model_inputs)

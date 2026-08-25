@@ -1,12 +1,11 @@
 config_type: simple_batch
 job_parameters:
   p: mit_normal_gpu,mit_preemptable,pi_donti_gpu
-  exclude: node5101
   requeue: __novalue__
   body: "source ~/.bashrc\nconda activate pfdelta2\nexec __launch__"
   mem: 64G
   # G: 1
-  gres: gpu:l40s:1
+  gres: gpu:l40s:1,gpu:h200:1
   output: canos_hyperparam_finetune_%j.out
   signal: USR1@90
   time: "05:59:00"
