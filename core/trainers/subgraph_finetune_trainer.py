@@ -84,9 +84,22 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         # post-training validation.
         self.max_epoch = train_params.get("epochs", self.max_epoch)
         saved_epoch = self.epoch
+        saved_checkpoint = self.checkpoint
         self.epoch = -1
-        self.calc_val_errors()
-        self.epoch = saved_epoch
+        # calc_val_errors() also calls save_summary(), which (in epochs mode)
+        # unconditionally looks up self.train_errors[self.best_point] -- give
+        # it a harmless empty placeholder, since no training epoch has run
+        # yet to populate a real one. And skip save_checkpoint() for this one
+        # call (if checkpointing is on), since it would otherwise capture
+        # this synthetic epoch=-1 into the checkpoint.
+        self.train_errors["-1"] = {}
+        self.checkpoint = False
+        try:
+            self.calc_val_errors()
+        finally:
+            self.checkpoint = saved_checkpoint
+            self.epoch = saved_epoch
+            del self.train_errors["-1"]
 
     def customize_model_init_inputs(self, model_inputs):
         super().customize_model_init_inputs(model_inputs)
