@@ -34,25 +34,22 @@ class SubgraphFinetuneTrainer(GNNTrainer):
        trained run's weights via `model.pretrained_path` in the config
        (a path to a `model.pt`/state_dict file).
 
-    3. Before any finetuning step, it runs one validation pass over all val
-       datasets with the just-warm-started model, so you have a baseline to
-       compare the finetuned numbers against (recorded under val_errors key
-       "-1", printed same as any other validation, saved to val.json). This
-       is skipped when resuming from a checkpoint, since a baseline was
-       already recorded on the original run.
-
-    4. If `train_loss[0]` is built the way the docstring above shows --
+    3. If `train_loss[0]` is built the way the docstring above shows --
        `combined_loss(loss1=<supervised combined_loss>, loss2=subproblem_
        consistency)` -- this wires any `recycle_loss` entries elsewhere in
        `train_loss` with `keyword: finetune_supervised` /
-       `keyword: finetune_consistency` to that supervised subtotal /
-       consistency subtotal respectively, so train.json can report both
-       components plus the combined total (train_loss[0] itself) without
-       recomputing anything twice, e.g.:
+       `keyword: finetune_consistency` / `keyword: finetune_subgraph_pbl` to
+       that supervised subtotal / consistency subtotal / subgraph physics-
+       residual subtotal respectively, so train.json can report all of them
+       plus the combined total (train_loss[0] itself) without recomputing
+       anything twice, e.g.:
 
            train_loss:
            - name: combined_loss          # index 0: backpropagated total
              ...
+             inp2: {pbl_weight: 0.1, ...} # optional: also penalize the
+                                           # subgraph's own physics residual
+                                           # (see SubproblemConsistencyLoss)
            - name: recycle_loss           # logged only: supervised subtotal
              recycled_parameter: loss
              loss_name: "Supervised subtotal"
@@ -61,55 +58,28 @@ class SubgraphFinetuneTrainer(GNNTrainer):
              recycled_parameter: loss
              loss_name: "Consistency subtotal"
              keyword: finetune_consistency
+           - name: recycle_loss           # logged only: subgraph PBL subtotal
+             recycled_parameter: pbl_loss
+             loss_name: "Subgraph PBL subtotal"
+             keyword: finetune_subgraph_pbl
+
+    4. Opt-in profiling: any `combined_loss`/`subproblem_consistency` entry
+       (found anywhere in train_loss/val_loss, arbitrarily nested) built
+       with `profile: true` gets its timings dict reset at the start of
+       every epoch and a summary printed at the end -- showing the split
+       between the pre-existing objective and the added subgraph-consistency
+       cost, and (for subproblem_consistency itself) a further breakdown of
+       where that cost goes: adjacency/BFS/tensor-building/rebatching vs.
+       the second forward pass vs. the subgraph PBL computation vs. the
+       consistency loss computation. E.g.:
+
+           train_loss:
+           - name: combined_loss
+             loss1: universal_power_balance
+             loss2: subproblem_consistency
+             inp2: {profile: true, ...}
+             profile: true
     """
-
-    def train(self):
-        self._evaluate_pretrained_baseline()
-        super().train()
-
-    def _evaluate_pretrained_baseline(self):
-        if self.checkpoint and self._checkpoint_used:
-            # Resuming a finetuning run that already has its own baseline
-            # entry -- don't re-evaluate (and don't touch self.epoch mid-resume).
-            return
-        print(
-            "\n\U0001f50d Evaluating the pretrained/warm-started model on all "
-            "validation sets before any finetuning step (baseline)..."
-        )
-        train_params = self.config["optim"]["train_params"]
-        # calc_val_errors keys its entry off self.epoch when max_epoch is set
-        # (see BaseTrainer.calc_val_errors) -- set both up the same way
-        # BaseTrainer._train does, but with epoch=-1, so this baseline gets
-        # its own distinct key instead of colliding with epoch 0's real
-        # post-training validation.
-        self.max_epoch = train_params.get("epochs", self.max_epoch)
-        saved_epoch = self.epoch
-        saved_checkpoint = self.checkpoint
-        self.epoch = -1
-        # calc_val_errors() also calls save_summary(), which (in epochs mode)
-        # unconditionally looks up self.train_errors[self.best_point] -- give
-        # it a NaN-filled placeholder (one entry per real train_loss_names
-        # key, matching what report_results() would normally produce), since
-        # no training epoch has run yet to populate a real one. This has to
-        # stay (not just for this one call): self.best_point remains "-1"
-        # until some real epoch actually beats the baseline, and every
-        # save_summary()/print_summary() call until then -- including the
-        # very last one, if finetuning never beats the baseline at all --
-        # does this same lookup by key name, so deleting it (or leaving it
-        # empty) would just move a KeyError to a later call instead of
-        # fixing it. Shows up as a harmless all-NaN "-1" entry in train.json.
-        self.train_errors.setdefault(
-            "-1", {name: float("nan") for name in self.train_loss_names}
-        )
-        # Skip save_checkpoint() for this one call (if checkpointing is on),
-        # since it would otherwise capture this synthetic epoch=-1 into the
-        # checkpoint.
-        self.checkpoint = False
-        try:
-            self.calc_val_errors()
-        finally:
-            self.checkpoint = saved_checkpoint
-            self.epoch = saved_epoch
 
     def customize_model_init_inputs(self, model_inputs):
         super().customize_model_init_inputs(model_inputs)
@@ -129,6 +99,9 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         for loss in list(self.train_loss) + list(self.val_loss):
             self._wire_subproblem_loss(loss)
         self._wire_recycle_losses()
+        self._profiled_losses = []
+        for loss in list(self.train_loss) + list(self.val_loss):
+            self._collect_profiled_losses(loss)
 
     def _wire_subproblem_loss(self, loss):
         if isinstance(loss, SubproblemConsistencyLoss):
@@ -136,6 +109,33 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         elif isinstance(loss, CombinedLoss):
             self._wire_subproblem_loss(loss.loss1)
             self._wire_subproblem_loss(loss.loss2)
+
+    def _collect_profiled_losses(self, loss):
+        if isinstance(loss, (CombinedLoss, SubproblemConsistencyLoss)) and getattr(
+            loss, "profile", False
+        ):
+            self._profiled_losses.append(loss)
+        if isinstance(loss, CombinedLoss):
+            self._collect_profiled_losses(loss.loss1)
+            self._collect_profiled_losses(loss.loss2)
+
+    def setup_pre_epoch(self):
+        super().setup_pre_epoch()
+        for loss in self._profiled_losses:
+            loss.timings.clear()
+
+    def setup_post_epoch(self):
+        super().setup_post_epoch()
+        if not self._profiled_losses:
+            return
+        print(f"\n\U000023f1️  Profiling summary (epoch {self.epoch + 1}):")
+        for loss in self._profiled_losses:
+            label = getattr(loss, "loss_name", type(loss).__name__)
+            print(f"  [{label}]")
+            for key, seconds in sorted(
+                loss.timings.items(), key=lambda kv: kv[1], reverse=True
+            ):
+                print(f"    {key:<24}: {seconds:.3f}s")
 
     def _wire_recycle_losses(self):
         # Only applies to the train_loss[0] == combined_loss(supervised,
@@ -149,5 +149,8 @@ class SubgraphFinetuneTrainer(GNNTrainer):
                 continue
             if loss.keyword == "finetune_supervised":
                 loss.source = outer.loss1
-            elif loss.keyword == "finetune_consistency":
+            elif loss.keyword in ("finetune_consistency", "finetune_subgraph_pbl"):
+                # Both live on the same subproblem_consistency instance --
+                # recycled_parameter in the config picks which attribute
+                # (.loss vs .pbl_loss) each entry actually reads.
                 loss.source = outer.loss2

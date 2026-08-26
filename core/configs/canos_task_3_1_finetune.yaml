@@ -116,9 +116,17 @@ optim:
     weight_decay: 0.0
   train_params:
     batch_size: 64
-    epochs: 30
+    epochs: 200
     train_loss:
     - name: combined_loss
+      # profile: true on both this and inp2 below -- prints a per-epoch
+      # breakdown (universal_power_balance vs subproblem_consistency, and
+      # within the latter: adjacency/BFS/tensor-building/rebatching vs the
+      # second forward pass vs loss computation) to figure out where the
+      # added epoch time is going. Safe to leave on; turn off once you've
+      # got your answer, it's not free (though far cheaper than what it's
+      # measuring).
+      profile: true
       loss1: universal_power_balance
       inp1:
         model: CANOS
@@ -137,12 +145,19 @@ optim:
         voltage_weight: 1.0
         injection_weight: 1.0
         edge_weight: 1.0
+        # Also penalize the subgraph prediction's own physics residual (KCL,
+        # via universal_power_balance computed on the subgraph alone) on top
+        # of the consistency terms above -- reuses the subgraph/second
+        # forward pass this loss already builds, no extra cost beyond the
+        # physics computation itself. 0.0 disables it.
+        pbl_weight: 0.1
+        profile: true
       lamb: _manual_list(0.01, 0.1 | 0.01, 0.1)  # weight of the consistency term relative to the supervised one
     # Logged only (see SubgraphFinetuneTrainer._wire_recycle_losses) -- pulls
     # the already-computed subtotals off train_loss[0] above for free, no
-    # extra forward pass, so train.json shows both components alongside the
-    # combined total (train_loss[0]'s own entry, named "PBL Mean+Subproblem
-    # consistency") that actually gets backpropagated.
+    # extra forward pass, so train.json shows all three components alongside
+    # the combined total (train_loss[0]'s own entry, named "PBL Mean+
+    # Subproblem consistency") that actually gets backpropagated.
     - name: recycle_loss
       recycled_parameter: power_balance_mean
       loss_name: "Universal power balance subtotal (PBL Mean, unweighted)"
@@ -151,6 +166,10 @@ optim:
       recycled_parameter: loss
       loss_name: "Consistency subtotal (subproblem_consistency, unweighted)"
       keyword: finetune_consistency
+    - name: recycle_loss
+      recycled_parameter: pbl_loss
+      loss_name: "Subgraph PBL subtotal (unweighted)"
+      keyword: finetune_subgraph_pbl
     - lamb: 0.1
       loss1: canos_pf_mse
       loss2: pf_constraint_violation

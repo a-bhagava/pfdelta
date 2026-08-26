@@ -29,20 +29,29 @@ turns it into a self-training/pseudo-label signal that needs no ground
 truth on the target topology.
 """
 
+import time
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
 from torch_geometric.data import Batch, HeteroData
 
 
-def _resolve_size(spec, reference_size: int) -> int:
-    """Turn a size spec into an absolute count, clamped to [1, reference_size].
-
-    A float < 1 is treated as a fraction of `reference_size`; anything else
-    is treated as an absolute count.
-    """
-    size = int(spec * reference_size) if isinstance(spec, float) and spec < 1 else int(spec)
-    return max(1, min(size, reference_size))
+@contextmanager
+def _timed(stats: Optional[dict], key: str):
+    """No-op when `stats` is None; otherwise accumulates wall-clock seconds
+    spent in the `with` block under `stats[key]` (summed across repeated
+    calls, e.g. once per training step) -- used for opt-in profiling of
+    where subproblem-construction time actually goes. See
+    SubgraphFinetuneTrainer for how these get reset/printed per epoch."""
+    if stats is None:
+        yield
+        return
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        stats[key] = stats.get(key, 0.0) + (time.perf_counter() - start)
 
 
 def build_adjacency(edge_index: torch.Tensor, num_nodes: int) -> list:
@@ -68,9 +77,12 @@ def sample_bus_subset(
 
     The subset is grown one shell at a time (each bus's unvisited neighbors,
     in random order) until it reaches a target size sampled uniformly from
-    [min_size, max_size] (a bound given as a float < 1 is treated as a
-    fraction of the seed's connected-component size). Because it's built as
-    a BFS tree, the returned subset is always connected.
+    [min_size, max_size]. Because it's built as a BFS tree, the returned
+    subset is always connected. Assumes the grid `seed_bus` sits in is
+    itself fully connected (no islanding) -- if `max_size` exceeds what's
+    actually reachable from `seed_bus`, growth just stops early once the
+    frontier is exhausted, returning a smaller subset than requested rather
+    than failing.
 
     Parameters
     ----------
@@ -81,8 +93,8 @@ def sample_bus_subset(
         another.
     seed_bus : int
         Global bus index to grow the subset from.
-    min_size, max_size : int or float
-        Target subset size bounds (see `_resolve_size`).
+    min_size, max_size : int
+        Target subset size bounds, as absolute bus counts.
     generator : torch.Generator, optional
         RNG used for the neighbor shuffle and size sampling.
 
@@ -91,31 +103,11 @@ def sample_bus_subset(
     torch.Tensor
         Sorted LongTensor of global bus indices in the sampled subset.
     """
-    # First discover the seed's reachable component, so fractional size
-    # specs are relative to something meaningful.
-    visited = {seed_bus}
-    order = [seed_bus]
-    frontier = [seed_bus]
-    while frontier:
-        next_frontier = []
-        for node in frontier:
-            for neighbor in adjacency[node]:
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    order.append(neighbor)
-                    next_frontier.append(neighbor)
-        frontier = next_frontier
-    component_size = len(order)
-
-    lo = _resolve_size(min_size, component_size)
-    hi = _resolve_size(max_size, component_size)
+    lo, hi = int(min_size), int(max_size)
     lo, hi = min(lo, hi), max(lo, hi)
     target_size = torch.randint(lo, hi + 1, (1,), generator=generator).item()
 
-    if target_size >= component_size:
-        return torch.tensor(sorted(visited), dtype=torch.long)
-
-    # Regrow the BFS, shuffling each shell, stopping once the target size is
+    # Grow the BFS, shuffling each shell, stopping once the target size is
     # hit -- so repeated calls from the same seed still vary.
     visited = {seed_bus}
     kept = [seed_bus]
@@ -372,11 +364,13 @@ def build_subproblem(
 def build_subproblem_batch(
     data,
     output_dict: dict,
-    min_size=0.1,
-    max_size=0.3,
+    min_size=10,
+    max_size=100,
     add_bus_type: Optional[bool] = None,
     detach_teacher: bool = True,
     generator: Optional[torch.Generator] = None,
+    adjacency_cache: Optional[dict] = None,
+    stats: Optional[dict] = None,
 ) -> tuple:
     """
     Apply `build_subproblem` once per sample in a batched `data`, sampling an
@@ -395,15 +389,29 @@ def build_subproblem_batch(
         Batched full-grid input that produced `output_dict`.
     output_dict : dict
         See `build_subproblem`.
-    min_size, max_size : int or float
-        Per-sample subgraph size bounds, passed to `sample_bus_subset`
-        (fractions of each sample's own bus count if < 1).
+    min_size, max_size : int
+        Per-sample subgraph size bounds (absolute bus counts), passed to
+        `sample_bus_subset`.
     add_bus_type : bool, optional
         See `build_subproblem`.
     detach_teacher : bool
         See `build_subproblem`.
     generator : torch.Generator, optional
         RNG for reproducible sampling.
+    adjacency_cache : dict, optional
+        Reused across calls (e.g. one dict owned by a long-lived
+        SubproblemConsistencyLoss instance) to skip rebuilding the adjacency
+        list when the branch topology hasn't changed since the last call --
+        common when every sample is drawn from the same case with no
+        contingency perturbation, so the topology is identical run-to-run
+        and only the demand/generation values vary. Self-verifying (checked
+        via `torch.equal` against the edge_index the cached adjacency was
+        built from), so it's never a correctness risk even if the topology
+        does vary between calls -- it just falls back to always rebuilding.
+    stats : dict, optional
+        Opt-in profiling: if given, accumulates wall-clock seconds (summed
+        across repeated calls) under keys "adjacency", "sample_bus_subset",
+        "build_subproblem", and "batch_from_data_list" -- see `_timed`.
 
     Returns
     -------
@@ -416,7 +424,20 @@ def build_subproblem_batch(
     num_buses = bus_store.num_nodes
     ptr = bus_store.ptr if "ptr" in bus_store else torch.tensor([0, num_buses], device=device)
 
-    adjacency = build_adjacency(data["bus", "branch", "bus"].edge_index, num_buses)
+    edge_index = data["bus", "branch", "bus"].edge_index
+    with _timed(stats, "adjacency"):
+        if (
+            adjacency_cache is not None
+            and adjacency_cache.get("edge_index") is not None
+            and adjacency_cache["edge_index"].shape == edge_index.shape
+            and torch.equal(adjacency_cache["edge_index"], edge_index)
+        ):
+            adjacency = adjacency_cache["adjacency"]
+        else:
+            adjacency = build_adjacency(edge_index, num_buses)
+            if adjacency_cache is not None:
+                adjacency_cache["edge_index"] = edge_index.detach().clone()
+                adjacency_cache["adjacency"] = adjacency
 
     sub_data_list, bus_maps, voltage_masks, edge_maps = [], [], [], []
     for k in range(ptr.numel() - 1):
@@ -424,22 +445,25 @@ def build_subproblem_batch(
         if hi <= lo:
             continue
         seed_bus = torch.randint(lo, hi, (1,), generator=generator).item()
-        bus_subset = sample_bus_subset(
-            adjacency, seed_bus, min_size, max_size, generator=generator
-        )
-        sub_data, bus_map, voltage_mask, edge_map = build_subproblem(
-            data,
-            output_dict,
-            bus_subset,
-            add_bus_type=add_bus_type,
-            detach_teacher=detach_teacher,
-        )
+        with _timed(stats, "sample_bus_subset"):
+            bus_subset = sample_bus_subset(
+                adjacency, seed_bus, min_size, max_size, generator=generator
+            )
+        with _timed(stats, "build_subproblem"):
+            sub_data, bus_map, voltage_mask, edge_map = build_subproblem(
+                data,
+                output_dict,
+                bus_subset,
+                add_bus_type=add_bus_type,
+                detach_teacher=detach_teacher,
+            )
         sub_data_list.append(sub_data)
         bus_maps.append(bus_map)
         voltage_masks.append(voltage_mask)
         edge_maps.append(edge_map)
 
-    sub_data_batch = Batch.from_data_list(sub_data_list)
+    with _timed(stats, "batch_from_data_list"):
+        sub_data_batch = Batch.from_data_list(sub_data_list)
     bus_map_all = torch.cat(bus_maps)
     voltage_mask_all = torch.cat(voltage_masks)
     edge_map_all = torch.cat(edge_maps)

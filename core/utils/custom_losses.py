@@ -7,7 +7,7 @@ from torch_geometric.data import HeteroData
 
 from core.utils.registry import registry
 from core.utils.pf_losses_utils import PowerBalanceLoss
-from core.utils.create_subproblem import build_subproblem_batch
+from core.utils.create_subproblem import _timed, build_subproblem_batch
 
 
 def loss_loader(class_name, class_inputs, class_type):
@@ -66,7 +66,7 @@ class CombinedLoss:
     Combines two loss functions with a weighting factor.
     """
 
-    def __init__(self, loss1, loss2, lamb=1, inp1={}, inp2={}):
+    def __init__(self, loss1, loss2, lamb=1, inp1={}, inp2={}, profile=False):
         self.loss1_name = loss1
         self.loss2_name = loss2
         self.lamb = lamb
@@ -77,6 +77,12 @@ class CombinedLoss:
         loss1_printname = getattr(self.loss1, "loss_name", loss1)
         loss2_printname = getattr(self.loss2, "loss_name", loss2)
         self.loss_name = loss1_printname + "+" + loss2_printname
+
+        # Opt-in profiling: accumulates wall-clock seconds (summed across
+        # repeated calls, e.g. once per training step) spent inside loss1
+        # vs loss2 -- see SubgraphFinetuneTrainer for reset/print handling.
+        self.profile = profile
+        self.timings = {} if profile else None
 
     def initialize_loss(self, loss_name, loss_inputs):
         # This is for pytorch losses
@@ -97,8 +103,10 @@ class CombinedLoss:
             return loss_class(**loss_inputs)
 
     def __call__(self, predictions, labels):
-        loss1 = self.loss1(predictions, labels)
-        loss2 = self.loss2(predictions, labels)
+        with _timed(self.timings, self.loss1_name):
+            loss1 = self.loss1(predictions, labels)
+        with _timed(self.timings, self.loss2_name):
+            loss2 = self.loss2(predictions, labels)
         weighted_loss = loss1 + self.lamb * loss2
         # Cached so a `recycle_loss` entry can report this subtotal (e.g. for
         # a nested combined_loss) without recomputing it -- see e.g.
@@ -121,6 +129,19 @@ class SubproblemConsistencyLoss:
     prediction, which is why this is CANOS_PF-specific (relies on its
     output_dict schema and its bus/PV/PQ/slack HeteroData layout).
 
+    Optionally (`pbl_weight > 0`, off by default) also penalizes the
+    subgraph prediction's own physics residual directly -- universal_power_
+    balance (KCL) computed on (sub_data, sub_outputs) alone, independent of
+    the teacher. This is a genuinely different signal from the consistency
+    terms above (which only ever compare student against teacher, never
+    check the student against physics on its own), so it's additive rather
+    than redundant. Deliberately folded in here rather than built as a
+    separate top-level loss: it reuses the subgraph this loss already built
+    and the second forward pass it already ran (both expensive -- see the
+    profiling this class supports), so no extra subgraph construction or
+    model call is needed, just one more cheap physics computation on
+    tensors already in hand.
+
     `self.model` must be set after construction -- the owning trainer is
     responsible for that (mirroring `recycle_loss`'s `.source` injection),
     since a live `nn.Module` can't be built from plain config kwargs. See
@@ -129,13 +150,15 @@ class SubproblemConsistencyLoss:
 
     def __init__(
         self,
-        min_size=0.1,
-        max_size=0.3,
+        min_size=10,
+        max_size=100,
         detach_teacher=True,
         voltage_weight=1.0,
         injection_weight=1.0,
         edge_weight=1.0,
+        pbl_weight=0.0,
         seed=None,
+        profile=False,
     ):
         self.model = None
         self.min_size = min_size
@@ -144,6 +167,7 @@ class SubproblemConsistencyLoss:
         self.voltage_weight = voltage_weight
         self.injection_weight = injection_weight
         self.edge_weight = edge_weight
+        self.pbl_weight = pbl_weight
         self.generator = (
             torch.Generator().manual_seed(seed) if seed is not None else None
         )
@@ -151,6 +175,18 @@ class SubproblemConsistencyLoss:
         # per-bus net P/Q injection, handling PQ/PV/slack uniformly).
         self._pbl = PowerBalanceLoss(model="CANOS")
         self.loss_name = "Subproblem consistency"
+        # Persists for the life of this loss instance (one per training run)
+        # so build_subproblem_batch can skip rebuilding the adjacency list
+        # when the branch topology hasn't changed since the last call -- see
+        # its adjacency_cache docstring.
+        self._adjacency_cache = {}
+        # Opt-in profiling: accumulates wall-clock seconds (summed across
+        # repeated calls) under "build_subproblem_batch" (itself broken down
+        # further -- see that function's own stats keys, merged into this
+        # same dict), "second_forward", and "loss_compute" -- see
+        # SubgraphFinetuneTrainer for reset/print handling.
+        self.profile = profile
+        self.timings = {} if profile else None
 
     def __call__(self, outputs, data):
         assert self.model is not None, (
@@ -166,46 +202,61 @@ class SubproblemConsistencyLoss:
             max_size=self.max_size,
             detach_teacher=self.detach_teacher,
             generator=self.generator,
+            adjacency_cache=self._adjacency_cache,
+            stats=self.timings,
         )
-        sub_outputs = self.model(sub_data)
+        with _timed(self.timings, "second_forward"):
+            sub_outputs = self.model(sub_data)
 
-        # Bus voltages: skip any promoted local-slack rows, since their (va, vm)
-        # is an echoed input on the subproblem side, not a prediction.
-        teacher_bus = outputs["bus"][bus_map][voltage_mask]
-        student_bus = sub_outputs["bus"][voltage_mask]
-        if self.detach_teacher:
-            teacher_bus = teacher_bus.detach()
-        self.voltage_loss = mse_loss(student_bus, teacher_bus)
+        with _timed(self.timings, "subgraph_pbl"):
+            # Physics residual on the subgraph's own prediction, independent
+            # of the teacher -- reuses self._pbl (already built for
+            # collect_model_predictions below) and its full __call__, which
+            # additionally runs calculate_PBL's branch-flow KCL check and
+            # caches the result as self._pbl.power_balance_mean.
+            self.pbl_loss = self._pbl(sub_outputs, sub_data)
 
-        # Net bus injections (P, Q). A genuine prediction on either side whenever
-        # that bus is PV/slack there; a harmless (~0) echoed-input term when both
-        # sides see it as PQ.
-        teacher_preds = self._pbl.collect_model_predictions("CANOS", data, outputs)
-        student_preds = self._pbl.collect_model_predictions("CANOS", sub_data, sub_outputs)
-        _, _, Pnet_t, Qnet_t = teacher_preds["predictions"]
-        _, _, Pnet_s, Qnet_s = student_preds["predictions"]
-        teacher_net = torch.stack([Pnet_t[bus_map], Qnet_t[bus_map]], dim=-1)
-        student_net = torch.stack([Pnet_s, Qnet_s], dim=-1)
-        if self.detach_teacher:
-            teacher_net = teacher_net.detach()
-        self.injection_loss = mse_loss(student_net, teacher_net)
+        with _timed(self.timings, "loss_compute"):
+            # Bus voltages: skip any promoted local-slack rows, since their
+            # (va, vm) is an echoed input on the subproblem side, not a prediction.
+            teacher_bus = outputs["bus"][bus_map][voltage_mask]
+            student_bus = sub_outputs["bus"][voltage_mask]
+            if self.detach_teacher:
+                teacher_bus = teacher_bus.detach()
+            self.voltage_loss = mse_loss(student_bus, teacher_bus)
 
-        # Interior branch flows (lines kept on both sides of the cut).
-        teacher_edges = outputs["edge_preds"][edge_map]
-        student_edges = sub_outputs["edge_preds"]
-        if self.detach_teacher:
-            teacher_edges = teacher_edges.detach()
-        self.edge_loss = (
-            mse_loss(student_edges, teacher_edges)
-            if student_edges.numel() > 0
-            else torch.zeros((), device=student_bus.device)
-        )
+            # Net bus injections (P, Q). A genuine prediction on either side
+            # whenever that bus is PV/slack there; a harmless (~0) echoed-input
+            # term when both sides see it as PQ.
+            teacher_preds = self._pbl.collect_model_predictions("CANOS", data, outputs)
+            student_preds = self._pbl.collect_model_predictions(
+                "CANOS", sub_data, sub_outputs
+            )
+            _, _, Pnet_t, Qnet_t = teacher_preds["predictions"]
+            _, _, Pnet_s, Qnet_s = student_preds["predictions"]
+            teacher_net = torch.stack([Pnet_t[bus_map], Qnet_t[bus_map]], dim=-1)
+            student_net = torch.stack([Pnet_s, Qnet_s], dim=-1)
+            if self.detach_teacher:
+                teacher_net = teacher_net.detach()
+            self.injection_loss = mse_loss(student_net, teacher_net)
 
-        self.loss = (
-            self.voltage_weight * self.voltage_loss
-            + self.injection_weight * self.injection_loss
-            + self.edge_weight * self.edge_loss
-        )
+            # Interior branch flows (lines kept on both sides of the cut).
+            teacher_edges = outputs["edge_preds"][edge_map]
+            student_edges = sub_outputs["edge_preds"]
+            if self.detach_teacher:
+                teacher_edges = teacher_edges.detach()
+            self.edge_loss = (
+                mse_loss(student_edges, teacher_edges)
+                if student_edges.numel() > 0
+                else torch.zeros((), device=student_bus.device)
+            )
+
+            self.loss = (
+                self.voltage_weight * self.voltage_loss
+                + self.injection_weight * self.injection_loss
+                + self.edge_weight * self.edge_loss
+                + self.pbl_weight * self.pbl_loss
+            )
         return self.loss
 
 
