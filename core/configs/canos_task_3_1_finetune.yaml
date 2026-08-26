@@ -1,15 +1,11 @@
 config_type: simple_batch
 job_parameters:
-  # SLURM has no "either GPU type" flag: --gres is an AND list (comma means
-  # "give me all of these"), and --constraint only matches node Features,
-  # not Gres types (hence "Invalid feature specification" -- l40s/h200 are
-  # registered as Gres here, not Features). Tied to the same "sgband" key as
-  # min_size/max_size/case_name/use_first_only below (not a separate key --
-  # that would cross-product into more jobs, not just route the existing
-  # ones) so each of the 10 jobs (5 bands x 2 lamb) gets routed to one pool,
-  # no duplication: 14/30/57 -> l40s, 118/wide -> h200.
-  p: _connected_list(sgband -- mit_normal_gpu, mit_preemptable, mit_preemptable, pi_donti_gpu, pi_donti_gpu | l40s, l40s, l40s, h200, h200)
-  gres: _connected_list(sgband -- gpu:l40s:1, gpu:l40s:1, gpu:l40s:1, gpu:h200:1, gpu:h200:1 | l40s, l40s, l40s, h200, h200)
+  # Every job runs on any of these partitions with 1 h200 -- no per-band GPU
+  # routing anymore (that's what the "sgband" connect key elsewhere in this
+  # file is for -- min_size/max_size/case_name/use_first_only/the two loss
+  # weights below all share it and must stay the same length).
+  p: mit_normal_gpu, mit_preemptable, pi_donti_gpu
+  gres: gpu:h200:1
   requeue: __novalue__
   body: "source ~/.bashrc\nconda activate pfdelta2\nexec __launch__"
   mem: 64G
@@ -54,7 +50,7 @@ dataset:
     # "wide" band doesn't target one case, so it repeats case118 here --
     # doesn't matter which, since use_first_only=false for that band means
     # this entry is just averaged in with everyone else, not singled out.
-    case_name: _connected_list(sgband -- case14, case30, case57, case118, case118 | 14, 30, 57, 118, wide)
+    case_name: _connected_list(sgband -- case30, case118, case118 | 30, 118, wide)
     model: CANOS
     name: pfdeltaCANOS
     root_dir: /orcd/pool/005/donti_shared/pfdelta_data
@@ -97,11 +93,20 @@ dataset:
     task: 1.3
 functional:
   run_location: canos_task_3_1_finetune
-  run_name: canos_k_steps15_hd256_lr1e-4_sgband_%min_size_cons_lam_%lamb_gpu%p_task_3_1_finetune
+  run_name: canos_k_steps15_hd256_lr1e-4_sgband_%min_size_w_sg_cons%w_sg_cons_w_sg_pbl%w_sg_pbl_task_3_1_finetune
   is_debug: false
   seed: 11
   cpu: false
   trainer_name: subgraph_finetune_trainer
+  # val_loss's subproblem_consistency entry (below) only actually runs on
+  # this val dataset index -- 5 is dataset.datasets[6] (case500, split:
+  # val -- the last entry), matching val_num in calc_one_val_error (0-indexed
+  # into dataset.datasets[1:]: 0=sgband-driven, 1=case14, 2=case30,
+  # 3=case57, 4=case118, 5=case500). It doesn't make sense to cut a subgraph
+  # out of case14/30/57/118 and compare it against ITS OWN full-grid
+  # prediction the way it does for case500 (the source grid these subgraphs
+  # are meant to approximate) -- see SubgraphFinetuneTrainer.calc_one_val_error.
+  consistency_val_indices: [5]
 model:
   dataset: _include_
   hidden_dim: 256
@@ -116,48 +121,69 @@ optim:
     weight_decay: 0.0
   train_params:
     batch_size: 64
-    epochs: 200
+    epochs: 80
     train_loss:
+    # Flat N-way combined_loss: total = 1.0*PBL + w2*consistency + w3*subgraph
+    # power-balance (universal_power_balance's weight is fixed at 1 by simply
+    # not tuning it -- weight defaults to 1 when omitted).
     - name: combined_loss
-      # profile: true on both this and inp2 below -- prints a per-epoch
-      # breakdown (universal_power_balance vs subproblem_consistency, and
-      # within the latter: adjacency/BFS/tensor-building/rebatching vs the
-      # second forward pass vs loss computation) to figure out where the
-      # added epoch time is going. Safe to leave on; turn off once you've
-      # got your answer, it's not free (though far cheaper than what it's
-      # measuring).
       profile: true
-      loss1: universal_power_balance
-      inp1:
-        model: CANOS
-      loss2: subproblem_consistency
-      inp2:
-        # min_size/max_size vary together (paired, not cross-producted) across
-        # five size bands -- four tight ones roughly matching case14/case30/
-        # case57/case118, plus a "wide" band spanning that whole range (case14
-        # through case118) to test whether training on diverse subgraph sizes
-        # transfers better overall than specializing to one target size. 5
-        # runs from this pair (not 25), since they share the "sgband" key.
-        min_size: _connected_list(sgband -- 10, 24, 48, 100, 10 | 14, 30, 57, 118, wide)
-        max_size: _connected_list(sgband -- 18, 36, 66, 136, 136 | 14, 30, 57, 118, wide)
-        detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
-                               # false for symmetric/joint gradients instead
-        voltage_weight: 1.0
-        injection_weight: 1.0
-        edge_weight: 1.0
-        # Also penalize the subgraph prediction's own physics residual (KCL,
-        # via universal_power_balance computed on the subgraph alone) on top
-        # of the consistency terms above -- reuses the subgraph/second
-        # forward pass this loss already builds, no extra cost beyond the
-        # physics computation itself. 0.0 disables it.
-        pbl_weight: 0.1
-        profile: true
-      lamb: _manual_list(0.01, 0.1 | 0.01, 0.1)  # weight of the consistency term relative to the supervised one
+      losses:
+      - name: universal_power_balance
+        inputs:
+          model: CANOS
+      - name: subproblem_consistency
+        # w2: weight of the consistency term. Tied to its own "consw" connect
+        # key (distinct from "sgband" below and "pblw" on w3) so it sweeps
+        # independently -- cross-producted with sgband (3) and pblw (2) below
+        # for 3*2*2=12 total jobs. consistency_weight_label is a decoy:
+        # CombinedLoss only reads name/weight/inputs from each losses[] entry
+        # and ignores anything else, so this extra key is free to carry a
+        # SEPARATE %consistency_weight_label run_name placeholder -- %weight
+        # alone would be ambiguous since w3 below also uses the literal key
+        # name "weight", and a bare string .replace() can't tell them apart
+        # (both %weight occurrences in run_name would get overwritten by
+        # whichever sweep's substitution runs first, silently hiding the
+        # other). The decoy's own key must be UNIQUE too -- naming both
+        # decoys "weight_label" would hit this exact same collision again.
+        weight: _connected_list(consw -- 0.01, 0.1 | 0.01, 0.1)
+        w_sg_cons: _connected_list(consw -- 0.01, 0.1 | 0.01, 0.1)
+        inputs:
+          # min_size/max_size vary together (paired, not cross-producted) across
+          # three size bands -- two tight ones (case30, case118), plus a "wide"
+          # band spanning that whole range to test whether training on diverse
+          # subgraph sizes transfers better overall than specializing to one
+          # target size. Shares the "sgband" key with case_name/use_first_only
+          # above and below (must all stay the same length).
+          min_size: _connected_list(sgband -- 24, 100, 10 | 30, 118, wide)
+          max_size: _connected_list(sgband -- 36, 136, 136 | 30, 118, wide)
+          detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
+                                 # false for symmetric/joint gradients instead
+          voltage_weight: 1.0
+          injection_weight: 1.0
+          edge_weight: 1.0
+          # pbl_weight left at its default (0.0): the subgraph power-balance
+          # term is its OWN independently-weighted component below (a
+          # recycle_loss reusing this same subgraph/second forward pass, no
+          # extra cost), not folded into this consistency subtotal --
+          # setting this nonzero here too would double-count it.
+          profile: true
+      - name: recycle_loss  # pulls subproblem_consistency.pbl_loss, computed just above
+        # w3: weight of the subgraph power-balance term. Own "pblw" connect
+        # key, independent of consw/sgband -- see the comment on w2 above for
+        # why subgraph_pbl_weight_label (a second, identically-swept, but
+        # UNIQUELY NAMED key) exists at all.
+        weight: _connected_list(pblw -- 0.1, 1 | 0.1, 1)
+        w_sg_pbl: _connected_list(pblw -- 0.1, 1 | 0.1, 1)
+        inputs:
+          recycled_parameter: pbl_loss
+          loss_name: "Subgraph power balance"
+          keyword: finetune_subgraph_pbl
     # Logged only (see SubgraphFinetuneTrainer._wire_recycle_losses) -- pulls
     # the already-computed subtotals off train_loss[0] above for free, no
-    # extra forward pass, so train.json shows all three components alongside
-    # the combined total (train_loss[0]'s own entry, named "PBL Mean+
-    # Subproblem consistency") that actually gets backpropagated.
+    # extra forward pass, so train.json shows all three components
+    # separately alongside the combined total (train_loss[0] itself) that
+    # actually gets backpropagated.
     - name: recycle_loss
       recycled_parameter: power_balance_mean
       loss_name: "Universal power balance subtotal (PBL Mean, unweighted)"
@@ -168,7 +194,7 @@ optim:
       keyword: finetune_consistency
     - name: recycle_loss
       recycled_parameter: pbl_loss
-      loss_name: "Subgraph PBL subtotal (unweighted)"
+      loss_name: "Subgraph power balance subtotal (unweighted)"
       keyword: finetune_subgraph_pbl
     - lamb: 0.1
       loss1: canos_pf_mse
@@ -176,16 +202,10 @@ optim:
       name: combined_loss
   val_params:
     batch_size: 64
-    # True (the 4 targeted bands): early stopping/best-model follows only the
-    # first-listed val dataset (dataset.datasets[1], tied to case_name above).
-    # False (the "wide" band): no single target case makes sense, so it
-    # averages the leading val_loss (PBL Mean) across ALL val datasets
-    # instead (see BaseTrainer.interpret_val_performance).
-    use_first_only: _connected_list(sgband -- true, true, true, true, false | 14, 30, 57, 118, wide)
-    early_stop:
-      decrease_by: 0.01
-      decrease_for: 20
-      needs_best_every: 30
+    # early_stop:
+    #   decrease_by: 0.01
+    #   decrease_for: 20
+    #   needs_best_every: 30
     report_every: 1
     val_loss:
     - model: CANOS
@@ -194,3 +214,39 @@ optim:
       loss1: canos_pf_mse
       loss2: pf_constraint_violation
       name: combined_loss
+    # Only actually evaluated on val dataset index 5 (case500) -- see
+    # functional.consistency_val_indices above; a NaN-returning stand-in
+    # runs in its place for case14/30/57/118 (no subgraph gets built for
+    # them). min_size/max_size reuse the exact same sgband-tagged values as
+    # train_loss[0]'s subproblem_consistency component above, so each job
+    # evaluates consistency at whatever size band it's actually training at.
+    - name: subproblem_consistency
+      min_size: _connected_list(sgband -- 24, 100, 10 | 30, 118, wide)
+      max_size: _connected_list(sgband -- 36, 136, 136 | 30, 118, wide)
+      detach_teacher: true
+      voltage_weight: 1.0
+      injection_weight: 1.0
+      edge_weight: 1.0
+      # pbl_weight left at its default (0.0): the subgraph power-balance
+      # residual is reported as its OWN separate val_loss entry below
+      # (recycle_loss, reads .pbl_loss -- still computed every call
+      # regardless of pbl_weight, just not folded into this entry's own
+      # .loss/reported number when pbl_weight is 0) instead of being folded
+      # into this one, so the two show up as distinct numbers in val.json.
+    # Logged only -- pulls the subgraph PBL subtotal off the
+    # subproblem_consistency entry just above for free (see
+    # SubgraphFinetuneTrainer._wire_recycle_losses, which wires a
+    # recycle_loss found in val_loss to val_loss's OWN subproblem_
+    # consistency instance, not train's -- they're separate objects). Only
+    # meaningful on val dataset index 5, same as the entry above --
+    # calc_one_val_error's swap also catches this entry specifically
+    # (not just the subproblem_consistency entry itself) and replaces it
+    # with the same NaN stand-in for every other val dataset, since
+    # otherwise it would read whatever .pbl_loss was left over on the
+    # shared instance from the last time consistency actually ran (case500,
+    # possibly a previous epoch) rather than something meaningful to
+    # case14/30/57/118.
+    - name: recycle_loss
+      recycled_parameter: pbl_loss
+      loss_name: "Subgraph power balance subtotal (unweighted)"
+      keyword: finetune_subgraph_pbl

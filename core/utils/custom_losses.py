@@ -63,24 +63,90 @@ class RecycleLoss:
 @registry.register_loss("combined_loss")
 class CombinedLoss:
     """
-    Combines two loss functions with a weighting factor.
+    Weighted sum of any number of loss components -- computed once each, in
+    order, as sum(weight_i * value_i) -- rather than needing awkward manual
+    nesting (combined_loss(loss1=combined_loss(a, b), loss2=c)) to combine
+    more than two.
+
+    Two equivalent ways to specify components:
+      - `losses: [{name, weight, inputs}, ...]` -- any number of components,
+        e.g.:
+            losses:
+            - name: universal_power_balance
+              weight: 1.0
+              inputs: {model: CANOS}
+            - name: subproblem_consistency
+              weight: 0.05
+              inputs: {min_size: 10, max_size: 100}
+            - name: recycle_loss   # a component can itself be a recycle_loss,
+              weight: 0.1          # reading an attribute off an EARLIER
+              inputs:               # component's own instance (e.g. .pbl_loss
+                recycled_parameter: pbl_loss   # off the subproblem_consistency
+                loss_name: "Subgraph PBL"      # above) instead of recomputing
+                keyword: finetune_subgraph_pbl # anything -- components run in
+                                                # order, and SubgraphFinetune
+                                                # Trainer._wire_recycle_losses
+                                                # wires recycle_loss.source to
+                                                # a matching sibling by type
+                                                # after construction.
+      - `loss1`/`loss2`/`lamb`/`inp1`/`inp2` -- the original 2-component
+        form, kept for backward compatibility with existing configs (e.g.
+        canos_task_1_3.yaml) and with GNNTrainer.modify_loss, which reads
+        `.loss1`/`.loss2` directly. Equivalent to
+        `losses: [{name: loss1, weight: 1, inputs: inp1},
+                   {name: loss2, weight: lamb, inputs: inp2}]`.
+
+    `self.loss` is the combined total (same meaning as before). `self.
+    components` is the list of (name, weight, instance) triples in order --
+    what SubgraphFinetuneTrainer's recursive walkers use to find/wire nested
+    loss instances regardless of how many components there are. `self.
+    loss1`/`self.loss2`/`self.lamb` alias the first two components (present
+    whenever there are at least that many) for the same backward-
+    compatibility reason as the constructor form.
     """
 
-    def __init__(self, loss1, loss2, lamb=1, inp1={}, inp2={}, profile=False):
-        self.loss1_name = loss1
-        self.loss2_name = loss2
-        self.lamb = lamb
+    def __init__(
+        self,
+        losses=None,
+        loss1=None,
+        loss2=None,
+        lamb=1,
+        inp1={},
+        inp2={},
+        profile=False,
+    ):
+        if losses is None:
+            assert loss1 is not None and loss2 is not None, (
+                "combined_loss needs either `losses: [...]` or both loss1/loss2!"
+            )
+            losses = [
+                {"name": loss1, "weight": 1, "inputs": inp1},
+                {"name": loss2, "weight": lamb, "inputs": inp2},
+            ]
 
-        self.loss1 = self.initialize_loss(loss1, inp1)
-        self.loss2 = self.initialize_loss(loss2, inp2)
+        self.components = []
+        printnames = []
+        for spec in losses:
+            name = spec["name"]
+            weight = spec.get("weight", 1)
+            inputs = spec.get("inputs", {})
+            instance = self.initialize_loss(name, inputs)
+            self.components.append((name, weight, instance))
+            printnames.append(getattr(instance, "loss_name", name))
+        self.loss_name = "+".join(printnames)
 
-        loss1_printname = getattr(self.loss1, "loss_name", loss1)
-        loss2_printname = getattr(self.loss2, "loss_name", loss2)
-        self.loss_name = loss1_printname + "+" + loss2_printname
+        # Backward-compat aliases -- GNNTrainer.modify_loss (and older
+        # configs/code) reads these directly, assuming the 2-component shape.
+        self.loss1 = self.components[0][2] if len(self.components) > 0 else None
+        self.loss2 = self.components[1][2] if len(self.components) > 1 else None
+        self.loss1_name = self.components[0][0] if len(self.components) > 0 else None
+        self.loss2_name = self.components[1][0] if len(self.components) > 1 else None
+        self.lamb = self.components[1][1] if len(self.components) > 1 else None
 
         # Opt-in profiling: accumulates wall-clock seconds (summed across
-        # repeated calls, e.g. once per training step) spent inside loss1
-        # vs loss2 -- see SubgraphFinetuneTrainer for reset/print handling.
+        # repeated calls, e.g. once per training step) spent inside each
+        # named component -- see SubgraphFinetuneTrainer for reset/print
+        # handling.
         self.profile = profile
         self.timings = {} if profile else None
 
@@ -103,16 +169,16 @@ class CombinedLoss:
             return loss_class(**loss_inputs)
 
     def __call__(self, predictions, labels):
-        with _timed(self.timings, self.loss1_name):
-            loss1 = self.loss1(predictions, labels)
-        with _timed(self.timings, self.loss2_name):
-            loss2 = self.loss2(predictions, labels)
-        weighted_loss = loss1 + self.lamb * loss2
-        # Cached so a `recycle_loss` entry can report this subtotal (e.g. for
-        # a nested combined_loss) without recomputing it -- see e.g.
+        total = None
+        for name, weight, instance in self.components:
+            with _timed(self.timings, name):
+                value = instance(predictions, labels)
+            total = weight * value if total is None else total + weight * value
+        # Cached so a `recycle_loss` entry can report this total (e.g. for a
+        # nested combined_loss) without recomputing it -- see e.g.
         # SubgraphFinetuneTrainer._wire_recycle_losses.
-        self.loss = weighted_loss
-        return weighted_loss
+        self.loss = total
+        return total
 
 
 @registry.register_loss("subproblem_consistency")
@@ -195,7 +261,7 @@ class SubproblemConsistencyLoss:
             "SubgraphFinetuneTrainer.modify_loss)."
         )
 
-        sub_data, bus_map, voltage_mask, edge_map = build_subproblem_batch(
+        sub_data, bus_map, voltage_mask, edge_map, va_offset = build_subproblem_batch(
             data,
             outputs,
             min_size=self.min_size,
@@ -221,6 +287,13 @@ class SubproblemConsistencyLoss:
             # (va, vm) is an echoed input on the subproblem side, not a prediction.
             teacher_bus = outputs["bus"][bus_map][voltage_mask]
             student_bus = sub_outputs["bus"][voltage_mask]
+            # A promoted local slack has its angle forced to 0 (see
+            # build_subproblem), shifting the student's whole angle solution
+            # by a constant offset relative to the teacher's -- subtract it
+            # back out of the teacher's va before comparing. Zero (a no-op)
+            # for every sample that kept its original slack bus.
+            teacher_va = teacher_bus[:, 0] - va_offset[voltage_mask]
+            teacher_bus = torch.stack([teacher_va, teacher_bus[:, 1]], dim=-1)
             if self.detach_teacher:
                 teacher_bus = teacher_bus.detach()
             self.voltage_loss = mse_loss(student_bus, teacher_bus)

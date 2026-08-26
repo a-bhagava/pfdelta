@@ -187,8 +187,15 @@ def build_subproblem(
     slack is elected from within the subset -- preferring a PV bus, since a
     PV bus's reactive generation is a genuine model prediction, so comparing
     it downstream is a meaningful consistency check rather than one that
-    trivially matches an echoed input -- and pinned to the full-grid model's
-    own predicted (va, vm) there.
+    trivially matches an echoed input. Its voltage magnitude is pinned to
+    the full-grid model's own predicted vm there (no reference-frame
+    ambiguity for an absolute quantity like vm), but its angle is forced to
+    0 rather than the teacher's predicted va -- every real slack bus in the
+    training data has va=0 as input by definition, so a nonzero value there
+    would be out-of-distribution for the student's forward pass. This shifts
+    the student's whole angle solution by a constant offset relative to the
+    teacher's (see `va_offset` below), which the consistency loss needs to
+    correct for.
 
     Works directly on a batched `data`/`output_dict`: `bus_subset` just
     needs to be a subset of one sample's own (batch-offset) bus indices,
@@ -233,6 +240,15 @@ def build_subproblem(
         `sub_data["bus","branch","bus"]` column i corresponds to row
         `edge_map[i]` of `data["bus","branch","bus"].edge_attr` /
         `output_dict["edge_preds"]`.
+    va_offset : torch.Tensor
+        Same length as `bus_map`/`voltage_mask`. If a new local slack was
+        promoted, every entry equals the teacher's own predicted va at that
+        promoted bus (the value discarded in favor of forcing 0) -- since
+        angle differences between buses are reference-independent, the
+        student's whole angle solution is offset from the teacher's by
+        exactly this amount, so subtract it from the teacher's va before
+        comparing against the student's. All zeros (a no-op) when the
+        original slack bus was kept and no promotion happened.
     """
     if add_bus_type is None:
         add_bus_type = "PQ" in data.node_types
@@ -289,6 +305,12 @@ def build_subproblem(
     global_slack_idx = (data["bus"].bus_type == 3).nonzero(as_tuple=True)[0]
     slack_kept = bool(keep_mask[global_slack_idx].any())
     voltage_mask = torch.ones(n_sub, dtype=torch.bool, device=device)
+    # Angle reference-frame offset introduced by promoting a new local slack
+    # (see below) -- 0 unless that happens. Broadcast to every retained bus
+    # in this sample so build_subproblem_batch can concatenate it alongside
+    # bus_map/voltage_mask; SubproblemConsistencyLoss subtracts it from the
+    # teacher's angles before comparing against the student's.
+    va_offset = torch.zeros(n_sub, device=device)
 
     new_src = new_index[src[interior_mask]]
     new_dst = new_index[dst[interior_mask]]
@@ -305,7 +327,24 @@ def build_subproblem(
             promote_pos = int(degree.argmax().item())
 
         bus_type[promote_pos] = 3
-        bus_voltages[promote_pos] = bus_pred[bus_subset[promote_pos]]
+        # Pin the promoted slack's voltage MAGNITUDE to the teacher's own
+        # prediction there (no reference-frame ambiguity for vm -- it's an
+        # absolute physical quantity). The ANGLE, though, is forced to 0
+        # rather than the teacher's predicted value: every real slack bus in
+        # the training data has va=0 as its input by definition (that's what
+        # "reference bus" means), so the model has never seen a nonzero
+        # angle fed in as a slack input -- using the teacher's arbitrary
+        # value here would be out-of-distribution for the student's own
+        # forward pass. This shifts the student's whole angle solution by
+        # exactly `teacher_va_at_promoted_bus` relative to the teacher's
+        # frame (physically: for two solutions of the same network, angle
+        # DIFFERENCES between buses are reference-independent, so pinning a
+        # different absolute value at the reference bus offsets every other
+        # bus's angle by that same amount) -- recorded in va_offset so the
+        # consistency loss can subtract it back out before comparing.
+        va_offset[:] = bus_pred[bus_subset[promote_pos], 0]
+        bus_voltages[promote_pos, 1] = bus_pred[bus_subset[promote_pos], 1]
+        bus_voltages[promote_pos, 0] = 0.0
         voltage_mask[promote_pos] = False
 
     pq_mask = bus_type == 1
@@ -358,7 +397,7 @@ def build_subproblem(
             sub_data["bus", f"{node_type}_link", node_type].edge_index = link_index.flip(0)
 
     bus_map = bus_subset.clone()
-    return sub_data, bus_map, voltage_mask, edge_map
+    return sub_data, bus_map, voltage_mask, edge_map, va_offset
 
 
 def build_subproblem_batch(
@@ -416,7 +455,7 @@ def build_subproblem_batch(
     Returns
     -------
     sub_data : Batch
-    bus_map, voltage_mask, edge_map : torch.Tensor
+    bus_map, voltage_mask, edge_map, va_offset : torch.Tensor
         Concatenated across the batch; see `build_subproblem`.
     """
     bus_store = data["bus"]
@@ -439,7 +478,7 @@ def build_subproblem_batch(
                 adjacency_cache["edge_index"] = edge_index.detach().clone()
                 adjacency_cache["adjacency"] = adjacency
 
-    sub_data_list, bus_maps, voltage_masks, edge_maps = [], [], [], []
+    sub_data_list, bus_maps, voltage_masks, edge_maps, va_offsets = [], [], [], [], []
     for k in range(ptr.numel() - 1):
         lo, hi = int(ptr[k].item()), int(ptr[k + 1].item())
         if hi <= lo:
@@ -450,7 +489,7 @@ def build_subproblem_batch(
                 adjacency, seed_bus, min_size, max_size, generator=generator
             )
         with _timed(stats, "build_subproblem"):
-            sub_data, bus_map, voltage_mask, edge_map = build_subproblem(
+            sub_data, bus_map, voltage_mask, edge_map, va_offset = build_subproblem(
                 data,
                 output_dict,
                 bus_subset,
@@ -461,11 +500,13 @@ def build_subproblem_batch(
         bus_maps.append(bus_map)
         voltage_masks.append(voltage_mask)
         edge_maps.append(edge_map)
+        va_offsets.append(va_offset)
 
     with _timed(stats, "batch_from_data_list"):
         sub_data_batch = Batch.from_data_list(sub_data_list)
     bus_map_all = torch.cat(bus_maps)
     voltage_mask_all = torch.cat(voltage_masks)
     edge_map_all = torch.cat(edge_maps)
+    va_offset_all = torch.cat(va_offsets)
 
-    return sub_data_batch, bus_map_all, voltage_mask_all, edge_map_all
+    return sub_data_batch, bus_map_all, voltage_mask_all, edge_map_all, va_offset_all
