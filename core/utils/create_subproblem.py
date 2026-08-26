@@ -400,6 +400,280 @@ def build_subproblem(
     return sub_data, bus_map, voltage_mask, edge_map, va_offset
 
 
+def _build_subproblem_vectorized(
+    data: HeteroData,
+    output_dict: dict,
+    bus_subset_list: list,
+    add_bus_type: Optional[bool] = None,
+    detach_teacher: bool = True,
+) -> tuple:
+    """
+    Batched equivalent of calling `build_subproblem` once per sample in
+    `bus_subset_list` (in order) and concatenating the results -- does the
+    whole transform (interior/tie split, tie-injection folding, slack
+    promotion, node-type reconstruction) ONCE across the concatenation of
+    every sample's own subset, instead of looping over samples in Python.
+
+    This is possible with no change in behavior because almost all of
+    `build_subproblem`'s math is already just elementwise/scatter ops
+    against `data`'s full (already batch-wide) tensors, restricted via a
+    `keep_mask`/`new_index` built from `bus_subset` -- looping per sample
+    was mostly just repeating that SAME batch-wide computation from
+    scratch, once per sample, plus paying for a GPU sync every single time
+    regardless of whether that sample even needed it (`bool(keep_mask[
+    global_slack_idx].any())`, to check whether the slack bus survived).
+    Block-diagonal batching guarantees an edge's two endpoints always
+    belong to the same original sample and different samples' bus_subsets
+    never overlap, so building `keep_mask`/`new_index` from the UNION of
+    every sample's subset is exactly equivalent to building it separately
+    per sample -- nothing here needs sample boundaries EXCEPT slack
+    promotion, which genuinely is per-sample-dependent (whether THIS
+    sample's own slack bus survived, and which of THIS sample's own buses
+    to promote if not). That's done as a single pair of segmented
+    reductions (`scatter_reduce_` with `reduce="amax"`/`"amin"`, grouped by
+    a `sample_id_sub` tensor) instead of a per-sample Python `argmax()
+    .item()` -- reproducing `argmax()`'s own first-occurrence tie-breaking
+    convention via an amin over (is-this-row-a-max ? global-row-index :
+    +inf).
+
+    Uses the exact same RNG-independent formulas as `build_subproblem`
+    (bus_subset_list is assumed already sampled, e.g. by the same BFS loop
+    build_subproblem_batch always used), so results are bit-for-bit
+    identical to looping `build_subproblem` over the same subsets -- this
+    is a performance-only rewrite, not a behavior change. See the
+    `test_adjacency_cache`-style equivalence test referenced in the module
+    history for how this was verified.
+
+    Returns
+    -------
+    sub_data_list : list[HeteroData]
+        One per sample (sliced back out of the vectorized union results),
+        ready for `Batch.from_data_list` -- still delegated to PyG's own
+        tested machinery for the actual ptr/batch/edge-increment batch
+        bookkeeping rather than reimplementing it by hand.
+    bus_map, voltage_mask, edge_map, va_offset : torch.Tensor
+        Concatenated across the batch in the same sample order as
+        `bus_subset_list`; see `build_subproblem`.
+    """
+    if add_bus_type is None:
+        add_bus_type = "PQ" in data.node_types
+    maybe_detach = (lambda t: t.detach()) if detach_teacher else (lambda t: t)
+
+    device = data["bus"].x.device
+    num_buses = data["bus"].num_nodes
+    num_samples = len(bus_subset_list)
+
+    sizes = [b.numel() for b in bus_subset_list]  # .numel() is metadata only, no sync
+    bus_subset_all = torch.cat(bus_subset_list)
+    n_sub_total = bus_subset_all.numel()
+    sizes_t = torch.tensor(sizes, device=device)
+    sample_id_sub = torch.repeat_interleave(torch.arange(num_samples, device=device), sizes_t)
+
+    keep_mask = torch.zeros(num_buses, dtype=torch.bool, device=device)
+    keep_mask[bus_subset_all] = True
+    new_index = torch.full((num_buses,), -1, dtype=torch.long, device=device)
+    new_index[bus_subset_all] = torch.arange(n_sub_total, device=device)
+
+    # ---- Branch edges: split into interior (both ends kept) / tie (one end kept) ----
+    edge_index = data["bus", "branch", "bus"].edge_index
+    edge_attr = data["bus", "branch", "bus"].edge_attr
+    src, dst = edge_index[0], edge_index[1]
+    src_in, dst_in = keep_mask[src], keep_mask[dst]
+    interior_mask = src_in & dst_in
+    tie_src_kept = src_in & ~dst_in
+    tie_dst_kept = dst_in & ~src_in
+
+    edge_preds = maybe_detach(output_dict["edge_preds"])
+    bus_pred = maybe_detach(output_dict["bus"])
+
+    # ---- Fold each cut tie-line's predicted flow into its retained endpoint's net injection ----
+    extra_p = torch.zeros(num_buses, device=device)
+    extra_q = torch.zeros(num_buses, device=device)
+    extra_p.scatter_add_(0, src[tie_src_kept], edge_preds[tie_src_kept, 0])
+    extra_q.scatter_add_(0, src[tie_src_kept], edge_preds[tie_src_kept, 1])
+    extra_p.scatter_add_(0, dst[tie_dst_kept], edge_preds[tie_dst_kept, 2])
+    extra_q.scatter_add_(0, dst[tie_dst_kept], edge_preds[tie_dst_kept, 3])
+
+    bus_type = data["bus"].bus_type[bus_subset_all].clone()
+    bus_demand = data["bus"].bus_demand[bus_subset_all].clone()
+    bus_gen = data["bus"].bus_gen[bus_subset_all].clone()
+    bus_voltages = data["bus"].bus_voltages[bus_subset_all].clone()
+    bus_shunts = data["bus"].shunt[bus_subset_all].clone()
+    voltage_limits = data["bus"].limits[bus_subset_all].clone()
+
+    bus_demand[:, 0] = bus_demand[:, 0] + extra_p[bus_subset_all]
+    bus_demand[:, 1] = bus_demand[:, 1] + extra_q[bus_subset_all]
+
+    new_src = new_index[src[interior_mask]]
+    new_dst = new_index[dst[interior_mask]]
+
+    # ---- Segmented slack promotion (the one genuinely per-sample-dependent
+    # step) -- always computed; the torch.where masking below makes it a
+    # no-op for any sample that already kept its own slack bus, so there's
+    # no need for a per-sample conditional (which would cost its own sync
+    # to evaluate anyway). ----
+    slack_present_row = (bus_type == 3).float()
+    slack_kept_per_sample = torch.zeros(num_samples, device=device)
+    slack_kept_per_sample.scatter_reduce_(
+        0, sample_id_sub, slack_present_row, reduce="amax", include_self=True
+    )
+    slack_kept_per_sample = slack_kept_per_sample > 0.5
+
+    degree = torch.zeros(n_sub_total, device=device)
+    degree.scatter_add_(0, new_src, torch.ones_like(new_src, dtype=torch.float))
+    degree.scatter_add_(0, new_dst, torch.ones_like(new_dst, dtype=torch.float))
+
+    pv_mask_pre = bus_type == 2
+    has_pv_in_sample = torch.zeros(num_samples, device=device)
+    has_pv_in_sample.scatter_reduce_(
+        0, sample_id_sub, pv_mask_pre.float(), reduce="amax", include_self=True
+    )
+    has_pv_in_sample = has_pv_in_sample > 0.5
+    prefer_pv_row = has_pv_in_sample[sample_id_sub]
+    neg_inf = float("-inf")
+    # Candidates: PV rows only for a sample that has one (its reactive
+    # generation is a genuine model prediction, worth comparing downstream
+    # -- see build_subproblem's own docstring), else every row.
+    candidate_degree = torch.where(
+        prefer_pv_row, torch.where(pv_mask_pre, degree, neg_inf), degree
+    )
+    seg_max = torch.full((num_samples,), neg_inf, device=device)
+    seg_max.scatter_reduce_(0, sample_id_sub, candidate_degree, reduce="amax", include_self=True)
+    is_seg_max_row = candidate_degree == seg_max[sample_id_sub]
+    row_idx = torch.arange(n_sub_total, device=device)
+    # First-occurrence tie-break, matching plain .argmax()'s own convention:
+    # among rows tied for the max, keep the smallest global row index --
+    # which, since bus_subset_list is concatenated sample-major, is also
+    # the smallest LOCAL row index within that sample.
+    tie_break = torch.where(is_seg_max_row, row_idx, n_sub_total)
+    promote_pos_global = torch.full((num_samples,), n_sub_total, dtype=torch.long, device=device)
+    promote_pos_global.scatter_reduce_(
+        0, sample_id_sub, tie_break, reduce="amin", include_self=True
+    )
+
+    promote_this_row = torch.zeros(n_sub_total, dtype=torch.bool, device=device)
+    needs_promotion_sample = ~slack_kept_per_sample
+    promote_this_row[promote_pos_global[needs_promotion_sample]] = True
+
+    bus_type = torch.where(promote_this_row, torch.full_like(bus_type, 3), bus_type)
+
+    promoted_bus_global_idx = bus_subset_all[promote_pos_global]
+    promoted_teacher_va = bus_pred[promoted_bus_global_idx, 0]
+    promoted_teacher_vm = bus_pred[promoted_bus_global_idx, 1]
+
+    voltage_mask = ~promote_this_row
+    va_offset = torch.where(
+        slack_kept_per_sample[sample_id_sub],
+        torch.zeros(n_sub_total, device=device),
+        promoted_teacher_va[sample_id_sub],
+    )
+    bus_voltages = bus_voltages.clone()
+    bus_voltages[promote_this_row, 1] = promoted_teacher_vm[sample_id_sub][promote_this_row]
+    bus_voltages[promote_this_row, 0] = 0.0
+
+    pq_mask = bus_type == 1
+    pv_mask = bus_type == 2
+    slack_mask = bus_type == 3
+
+    pf_x = torch.zeros(n_sub_total, 2, device=device)
+    pf_x[pq_mask] = bus_demand[pq_mask]
+    pf_x[pv_mask, 0] = bus_gen[pv_mask, 0] - bus_demand[pv_mask, 0]
+    pf_x[pv_mask, 1] = bus_voltages[pv_mask, 1]
+    pf_x[slack_mask] = bus_voltages[slack_mask]
+
+    edge_index_sub = torch.stack([new_src, new_dst])
+    edge_attr_sub = edge_attr[interior_mask]
+    has_edge_limits = "edge_limits" in data["bus", "branch", "bus"]
+    edge_limits_sub = (
+        data["bus", "branch", "bus"].edge_limits[interior_mask] if has_edge_limits else None
+    )
+    edge_map_all = interior_mask.nonzero(as_tuple=True)[0]
+
+    # Per-sample edge counts -- recovered the same way bus counts were
+    # (edge_index_sub is already sample-major, since new_src/new_dst are),
+    # needed to slice edge_index_sub/edge_attr_sub back apart below (edge
+    # counts vary independently of bus counts, so `sizes` alone isn't
+    # enough).
+    edge_sample_id = sample_id_sub[new_src]
+    edge_sizes = torch.zeros(num_samples, dtype=torch.long, device=device)
+    edge_sizes.scatter_add_(0, edge_sample_id, torch.ones_like(edge_sample_id))
+    edge_sizes_list = edge_sizes.tolist()
+
+    # ---- Slice the vectorized union results back into per-sample HeteroData
+    # objects. Still a Python loop, but every op in it is a cheap tensor
+    # slice/construction -- none of it forces a GPU sync the way the old
+    # per-sample loop's `bool(...)`/`.item()` calls did, so the GPU queue
+    # never blocks waiting on the CPU between iterations. ----
+    sub_data_list = []
+    bus_offset = 0
+    edge_offset = 0
+    for k in range(num_samples):
+        n_k = sizes[k]
+        e_k = edge_sizes_list[k]
+        bus_slice = slice(bus_offset, bus_offset + n_k)
+        edge_slice = slice(edge_offset, edge_offset + e_k)
+
+        sub_data = HeteroData()
+        sub_data["bus"].x = pf_x[bus_slice]
+        sub_data["bus"].num_nodes = n_k
+        sub_data["bus"].bus_gen = bus_gen[bus_slice]
+        sub_data["bus"].bus_demand = bus_demand[bus_slice]
+        sub_data["bus"].bus_voltages = bus_voltages[bus_slice]
+        sub_data["bus"].bus_type = bus_type[bus_slice]
+        sub_data["bus"].shunt = bus_shunts[bus_slice]
+        sub_data["bus"].limits = voltage_limits[bus_slice]
+
+        sub_data["bus", "branch", "bus"].edge_index = edge_index_sub[:, edge_slice] - bus_offset
+        sub_data["bus", "branch", "bus"].edge_attr = edge_attr_sub[edge_slice]
+        if has_edge_limits:
+            sub_data["bus", "branch", "bus"].edge_limits = edge_limits_sub[edge_slice]
+
+        if "gen" in data.node_types or "load" in data.node_types:
+            # _remap_node_type filters data[node_type] down to whichever
+            # entries attach to a KEPT bus -- the global (union) keep_mask/
+            # new_index would incorrectly pull in every OTHER sample's gen/
+            # load nodes too, not just this one's, so scope both to this
+            # sample's own subset instead (off the hot path: CANOS's own
+            # dataset never populates gen/load -- see build_subproblem's
+            # own comment above -- so this only runs for other dataset
+            # variants that do).
+            keep_mask_k = torch.zeros(num_buses, dtype=torch.bool, device=device)
+            keep_mask_k[bus_subset_list[k]] = True
+            new_index_k = torch.full((num_buses,), -1, dtype=torch.long, device=device)
+            new_index_k[bus_subset_list[k]] = torch.arange(n_k, device=device)
+            if "gen" in data.node_types:
+                _remap_node_type(data, sub_data, "gen", "gen_link", keep_mask_k, new_index_k)
+            if "load" in data.node_types:
+                _remap_node_type(data, sub_data, "load", "load_link", keep_mask_k, new_index_k)
+
+        if add_bus_type:
+            local_pf_x = pf_x[bus_slice]
+            local_bus_demand = bus_demand[bus_slice]
+            local_bus_gen = bus_gen[bus_slice]
+            local_masks = {
+                "PQ": pq_mask[bus_slice],
+                "PV": pv_mask[bus_slice],
+                "slack": slack_mask[bus_slice],
+            }
+            for node_type, mask in local_masks.items():
+                positions = mask.nonzero(as_tuple=True)[0]
+                sub_data[node_type].x = local_pf_x[positions]
+                if node_type != "PQ":
+                    sub_data[node_type].demand = local_bus_demand[positions]
+                    sub_data[node_type].generation = local_bus_gen[positions]
+                link_index = torch.stack(
+                    [torch.arange(positions.numel(), device=device), positions]
+                )
+                sub_data[node_type, f"{node_type}_link", "bus"].edge_index = link_index
+                sub_data["bus", f"{node_type}_link", node_type].edge_index = link_index.flip(0)
+
+        sub_data_list.append(sub_data)
+        bus_offset += n_k
+        edge_offset += e_k
+
+    return sub_data_list, bus_subset_all, voltage_mask, edge_map_all, va_offset
+
+
 def build_subproblem_batch(
     data,
     output_dict: dict,
@@ -409,6 +683,7 @@ def build_subproblem_batch(
     detach_teacher: bool = True,
     generator: Optional[torch.Generator] = None,
     adjacency_cache: Optional[dict] = None,
+    verify_every: int = 200,
     stats: Optional[dict] = None,
 ) -> tuple:
     """
@@ -443,10 +718,26 @@ def build_subproblem_batch(
         list when the branch topology hasn't changed since the last call --
         common when every sample is drawn from the same case with no
         contingency perturbation, so the topology is identical run-to-run
-        and only the demand/generation values vary. Self-verifying (checked
-        via `torch.equal` against the edge_index the cached adjacency was
-        built from), so it's never a correctness risk even if the topology
-        does vary between calls -- it just falls back to always rebuilding.
+        and only the demand/generation values vary. Self-verifying, but only
+        every `verify_every` calls (not every single one): on a shape match
+        it's trusted without a full `torch.equal` most of the time, since on
+        GPU tensors that comparison forces a device sync -- and because
+        PyTorch dispatches CUDA work asynchronously, that sync doesn't just
+        cost the comparison itself, it blocks on everything queued before it
+        (the model's own forward pass, any preceding loss computation),
+        which otherwise wouldn't actually be waited on until something later
+        forces a sync anyway. Doing that every call was misattributing most
+        of a training step's real GPU time to this cache check. A shape
+        *mismatch* (e.g. a genuinely different case) is always caught
+        immediately and triggers an unconditional rebuild + re-verify,
+        regardless of `verify_every` -- only a same-shape-but-different-
+        content change (topology drift with an identical bus/edge count,
+        which nothing else in this pipeline currently produces) could go
+        undetected for up to `verify_every` calls.
+    verify_every : int, optional
+        How often (in calls with a shape-matching cache) to pay for a full
+        `torch.equal` re-verification instead of trusting the cache
+        outright. Default 200. Irrelevant if `adjacency_cache` is None.
     stats : dict, optional
         Opt-in profiling: if given, accumulates wall-clock seconds (summed
         across repeated calls) under keys "adjacency", "sample_bus_subset",
@@ -465,48 +756,67 @@ def build_subproblem_batch(
 
     edge_index = data["bus", "branch", "bus"].edge_index
     with _timed(stats, "adjacency"):
-        if (
-            adjacency_cache is not None
-            and adjacency_cache.get("edge_index") is not None
-            and adjacency_cache["edge_index"].shape == edge_index.shape
-            and torch.equal(adjacency_cache["edge_index"], edge_index)
-        ):
-            adjacency = adjacency_cache["adjacency"]
+        cached_edge_index = (
+            adjacency_cache.get("edge_index") if adjacency_cache is not None else None
+        )
+        if cached_edge_index is not None and cached_edge_index.shape == edge_index.shape:
+            adjacency_cache["calls_since_verify"] = (
+                adjacency_cache.get("calls_since_verify", 0) + 1
+            )
+            if adjacency_cache["calls_since_verify"] < verify_every:
+                adjacency = adjacency_cache["adjacency"]
+            elif torch.equal(cached_edge_index, edge_index):
+                adjacency_cache["calls_since_verify"] = 0
+                adjacency = adjacency_cache["adjacency"]
+            else:
+                adjacency = build_adjacency(edge_index, num_buses)
+                adjacency_cache["edge_index"] = edge_index.detach().clone()
+                adjacency_cache["adjacency"] = adjacency
+                adjacency_cache["calls_since_verify"] = 0
         else:
             adjacency = build_adjacency(edge_index, num_buses)
             if adjacency_cache is not None:
                 adjacency_cache["edge_index"] = edge_index.detach().clone()
                 adjacency_cache["adjacency"] = adjacency
+                adjacency_cache["calls_since_verify"] = 0
 
-    sub_data_list, bus_maps, voltage_masks, edge_maps, va_offsets = [], [], [], [], []
-    for k in range(ptr.numel() - 1):
-        lo, hi = int(ptr[k].item()), int(ptr[k + 1].item())
-        if hi <= lo:
-            continue
-        seed_bus = torch.randint(lo, hi, (1,), generator=generator).item()
-        with _timed(stats, "sample_bus_subset"):
-            bus_subset = sample_bus_subset(
-                adjacency, seed_bus, min_size, max_size, generator=generator
+    # Sample a connected bus subset per graph. Still a Python loop -- BFS
+    # growth is inherently sequential (see sample_bus_subset) and already
+    # cheap/CPU-only (adjacency is a plain Python list of lists, and
+    # `generator` is a CPU torch.Generator, so nothing here touches the
+    # GPU) -- but `ptr` itself is read to host ONCE up front instead of
+    # `.item()`-ing it twice per sample, which forced a GPU sync on every
+    # iteration for no reason (ptr is tiny and never changes mid-loop). The
+    # actual per-sample GPU-sync cost lived in the transform below, not
+    # here -- see _build_subproblem_vectorized's docstring.
+    with _timed(stats, "sample_bus_subset"):
+        ptr_list = ptr.tolist()
+        bus_subset_list = []
+        for k in range(len(ptr_list) - 1):
+            lo, hi = ptr_list[k], ptr_list[k + 1]
+            if hi <= lo:
+                continue
+            seed_bus = torch.randint(lo, hi, (1,), generator=generator).item()
+            bus_subset_list.append(
+                sample_bus_subset(adjacency, seed_bus, min_size, max_size, generator=generator)
             )
-        with _timed(stats, "build_subproblem"):
-            sub_data, bus_map, voltage_mask, edge_map, va_offset = build_subproblem(
-                data,
-                output_dict,
-                bus_subset,
-                add_bus_type=add_bus_type,
-                detach_teacher=detach_teacher,
-            )
-        sub_data_list.append(sub_data)
-        bus_maps.append(bus_map)
-        voltage_masks.append(voltage_mask)
-        edge_maps.append(edge_map)
-        va_offsets.append(va_offset)
+
+    with _timed(stats, "build_subproblem"):
+        (
+            sub_data_list,
+            bus_map_all,
+            voltage_mask_all,
+            edge_map_all,
+            va_offset_all,
+        ) = _build_subproblem_vectorized(
+            data,
+            output_dict,
+            bus_subset_list,
+            add_bus_type=add_bus_type,
+            detach_teacher=detach_teacher,
+        )
 
     with _timed(stats, "batch_from_data_list"):
         sub_data_batch = Batch.from_data_list(sub_data_list)
-    bus_map_all = torch.cat(bus_maps)
-    voltage_mask_all = torch.cat(voltage_masks)
-    edge_map_all = torch.cat(edge_maps)
-    va_offset_all = torch.cat(va_offsets)
 
     return sub_data_batch, bus_map_all, voltage_mask_all, edge_map_all, va_offset_all
