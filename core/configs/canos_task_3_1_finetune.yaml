@@ -42,21 +42,6 @@ dataset:
     split: train
     task: 1.3
   - add_bus_type: true
-    # First-listed val dataset -- this is the one early_stop_now/is_new_best
-    # actually use (see val_params.use_first_only below and
-    # BaseTrainer.interpret_val_performance), so tying its case to the same
-    # sgband key as min_size/max_size makes early stopping/best-model
-    # selection follow whichever case matches each job's size band. The
-    # "wide" band doesn't target one case, so it repeats case118 here --
-    # doesn't matter which, since use_first_only=false for that band means
-    # this entry is just averaged in with everyone else, not singled out.
-    case_name: _connected_list(sgband -- case30, case118, case118 | 30, 118, wide)
-    model: CANOS
-    name: pfdeltaCANOS
-    root_dir: /orcd/pool/005/donti_shared/pfdelta_data
-    split: val
-    task: 1.3
-  - add_bus_type: true
     case_name: case14
     model: CANOS
     name: pfdeltaCANOS
@@ -99,14 +84,14 @@ functional:
   cpu: false
   trainer_name: subgraph_finetune_trainer
   # val_loss's subproblem_consistency entry (below) only actually runs on
-  # this val dataset index -- 5 is dataset.datasets[6] (case500, split:
+  # this val dataset index -- 4 is dataset.datasets[5] (case500, split:
   # val -- the last entry), matching val_num in calc_one_val_error (0-indexed
-  # into dataset.datasets[1:]: 0=sgband-driven, 1=case14, 2=case30,
-  # 3=case57, 4=case118, 5=case500). It doesn't make sense to cut a subgraph
-  # out of case14/30/57/118 and compare it against ITS OWN full-grid
-  # prediction the way it does for case500 (the source grid these subgraphs
-  # are meant to approximate) -- see SubgraphFinetuneTrainer.calc_one_val_error.
-  consistency_val_indices: [5]
+  # into dataset.datasets[1:]: 0=case14, 1=case30, 2=case57, 3=case118,
+  # 4=case500). It doesn't make sense to cut a subgraph out of
+  # case14/30/57/118 and compare it against ITS OWN full-grid prediction the
+  # way it does for case500 (the source grid these subgraphs are meant to
+  # approximate) -- see SubgraphFinetuneTrainer.calc_one_val_error.
+  consistency_val_indices: [4]
 model:
   dataset: _include_
   hidden_dim: 256
@@ -214,7 +199,7 @@ optim:
       loss1: canos_pf_mse
       loss2: pf_constraint_violation
       name: combined_loss
-    # Only actually evaluated on val dataset index 5 (case500) -- see
+    # Only actually evaluated on val dataset index 4 (case500) -- see
     # functional.consistency_val_indices above; a NaN-returning stand-in
     # runs in its place for case14/30/57/118 (no subgraph gets built for
     # them). min_size/max_size reuse the exact same sgband-tagged values as
@@ -238,7 +223,7 @@ optim:
     # SubgraphFinetuneTrainer._wire_recycle_losses, which wires a
     # recycle_loss found in val_loss to val_loss's OWN subproblem_
     # consistency instance, not train's -- they're separate objects). Only
-    # meaningful on val dataset index 5, same as the entry above --
+    # meaningful on val dataset index 4, same as the entry above --
     # calc_one_val_error's swap also catches this entry specifically
     # (not just the subproblem_consistency entry itself) and replaces it
     # with the same NaN stand-in for every other val dataset, since
