@@ -464,7 +464,12 @@ def _build_subproblem_vectorized(
     num_samples = len(bus_subset_list)
 
     sizes = [b.numel() for b in bus_subset_list]  # .numel() is metadata only, no sync
-    bus_subset_all = torch.cat(bus_subset_list)
+    # sample_bus_subset returns a plain CPU tensor regardless of `data`'s own
+    # device (see its own implementation) -- build_subproblem always moved
+    # this to `device` before use; do the same here for the concatenated
+    # union, or every downstream indexing op against a GPU-resident `data`
+    # fails with a device mismatch.
+    bus_subset_all = torch.cat(bus_subset_list).to(device=device, dtype=torch.long)
     n_sub_total = bus_subset_all.numel()
     sizes_t = torch.tensor(sizes, device=device)
     sample_id_sub = torch.repeat_interleave(torch.arange(num_samples, device=device), sizes_t)
@@ -545,11 +550,16 @@ def _build_subproblem_vectorized(
     # among rows tied for the max, keep the smallest global row index --
     # which, since bus_subset_list is concatenated sample-major, is also
     # the smallest LOCAL row index within that sample.
-    tie_break = torch.where(is_seg_max_row, row_idx, n_sub_total)
-    promote_pos_global = torch.full((num_samples,), n_sub_total, dtype=torch.long, device=device)
-    promote_pos_global.scatter_reduce_(
+    # Done in float rather than int64 -- some backends (e.g. MPS pre-macOS
+    # 15) don't support amin/amax scatter_reduce on integer dtypes at all,
+    # and float32 is exact for integers well past any realistic n_sub_total
+    # here (batch-wide subgraph bus count), so there's no precision cost.
+    tie_break = torch.where(is_seg_max_row, row_idx.float(), float(n_sub_total))
+    promote_pos_global_f = torch.full((num_samples,), float(n_sub_total), device=device)
+    promote_pos_global_f.scatter_reduce_(
         0, sample_id_sub, tie_break, reduce="amin", include_self=True
     )
+    promote_pos_global = promote_pos_global_f.long()
 
     promote_this_row = torch.zeros(n_sub_total, dtype=torch.bool, device=device)
     needs_promotion_sample = ~slack_kept_per_sample
@@ -637,10 +647,15 @@ def _build_subproblem_vectorized(
             # dataset never populates gen/load -- see build_subproblem's
             # own comment above -- so this only runs for other dataset
             # variants that do).
+            # Use bus_subset_all's own slice (already migrated to `device`
+            # above), not bus_subset_list[k] directly -- sample_bus_subset
+            # always returns a plain CPU tensor regardless of `data`'s own
+            # device, so indexing a GPU tensor with it would fail exactly
+            # like the bug fixed above for bus_subset_all itself.
             keep_mask_k = torch.zeros(num_buses, dtype=torch.bool, device=device)
-            keep_mask_k[bus_subset_list[k]] = True
+            keep_mask_k[bus_subset_all[bus_slice]] = True
             new_index_k = torch.full((num_buses,), -1, dtype=torch.long, device=device)
-            new_index_k[bus_subset_list[k]] = torch.arange(n_k, device=device)
+            new_index_k[bus_subset_all[bus_slice]] = torch.arange(n_k, device=device)
             if "gen" in data.node_types:
                 _remap_node_type(data, sub_data, "gen", "gen_link", keep_mask_k, new_index_k)
             if "load" in data.node_types:
