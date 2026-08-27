@@ -142,6 +142,22 @@ optim:
           # above and below (must all stay the same length).
           min_size: _connected_list(sgband -- 24, 100, 10 | 30, 118, wide)
           max_size: _connected_list(sgband -- 36, 136, 136 | 30, 118, wide)
+          # 4 independent subgraph draws per case500 sample per step (own
+          # seed bus/BFS growth each -- see build_subproblem_batch), instead
+          # of just 1. Fixed here, not swept (unlike sgband/consw/pblw
+          # above) -- change to a _connected_list(...) tied to a new key if
+          # you want to sweep it later. Memory/compute for the second
+          # forward pass scales with total subgraph node count, so this is
+          # roughly a 4x bigger second pass, still well under the first
+          # pass's own 64*500=32000-node footprint even at the "wide" band's
+          # max_size=136 (64*4*136=34816 -- close to parity; the tighter
+          # bands leave more headroom). voltage_loss/injection_loss/
+          # edge_loss/subgraph PBL are all pooled per-subgraph before being
+          # averaged (see custom_losses._per_subgraph_mse and
+          # PowerBalanceLoss's own aggregation), so a sample doesn't get 4x
+          # the gradient weight just because it contributed 4 subgraphs --
+          # see SubproblemConsistencyLoss's own docstring.
+          subgraphs_per_sample: 4
           detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
                                  # false for symmetric/joint gradients instead
           voltage_weight: 1.0
@@ -208,6 +224,10 @@ optim:
     - name: subproblem_consistency
       min_size: _connected_list(sgband -- 24, 100, 10 | 30, 118, wide)
       max_size: _connected_list(sgband -- 36, 136, 136 | 30, 118, wide)
+      # Matches train_loss[0]'s subproblem_consistency component above, so
+      # val reports consistency at the same subgraph-count regime the job
+      # is actually training at.
+      subgraphs_per_sample: 4
       detach_teacher: true
       voltage_weight: 1.0
       injection_weight: 1.0

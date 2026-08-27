@@ -214,10 +214,16 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         for loss in self._profiled_losses:
             label = getattr(loss, "loss_name", type(loss).__name__)
             print(f"  [{label}]")
-            for key, seconds in sorted(
-                loss.timings.items(), key=lambda kv: kv[1], reverse=True
-            ):
+            # Entries keyed "*#count" (see create_subproblem._bump) are
+            # plain integer counters, not wall-clock seconds -- printed
+            # separately so they don't get sorted/formatted as "%.3fs"
+            # alongside the real timings.
+            timing_items = {k: v for k, v in loss.timings.items() if not k.endswith("#count")}
+            count_items = {k: v for k, v in loss.timings.items() if k.endswith("#count")}
+            for key, seconds in sorted(timing_items.items(), key=lambda kv: kv[1], reverse=True):
                 print(f"    {key:<24}: {seconds:.3f}s")
+            for key, count in sorted(count_items.items(), key=lambda kv: kv[1], reverse=True):
+                print(f"    {key[: -len('#count')]:<24}: {count} calls")
 
     def _wire_recycle_losses(self):
         # Finds the canonical universal_power_balance / subproblem_

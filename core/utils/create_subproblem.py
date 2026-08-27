@@ -54,6 +54,18 @@ def _timed(stats: Optional[dict], key: str):
         stats[key] = stats.get(key, 0.0) + (time.perf_counter() - start)
 
 
+def _bump(stats: Optional[dict], key: str) -> None:
+    """No-op when `stats` is None; otherwise increments an integer counter
+    at `stats[key]` -- same dict/reset lifecycle as `_timed`'s wall-clock
+    entries (see SubgraphFinetuneTrainer), but a plain count rather than
+    seconds. Key must end in `#count` so the trainer's printer knows to
+    format it as an integer instead of a "%.3fs" duration."""
+    assert key.endswith("#count"), f"_bump key must end in '#count', got {key!r}"
+    if stats is None:
+        return
+    stats[key] = stats.get(key, 0) + 1
+
+
 def build_adjacency(edge_index: torch.Tensor, num_nodes: int) -> list:
     """Build an undirected adjacency list from a directed branch edge_index."""
     adjacency = [[] for _ in range(num_nodes)]
@@ -699,18 +711,28 @@ def build_subproblem_batch(
     generator: Optional[torch.Generator] = None,
     adjacency_cache: Optional[dict] = None,
     verify_every: int = 200,
+    subgraphs_per_sample: int = 1,
     stats: Optional[dict] = None,
 ) -> tuple:
     """
-    Apply `build_subproblem` once per sample in a batched `data`, sampling an
-    independent random connected bus subset per sample, and re-batch the
-    results into a single HeteroData batch ready for another forward pass.
+    Apply `build_subproblem` `subgraphs_per_sample` times per sample in a
+    batched `data` (each an independently-sampled random connected bus
+    subset), and re-batch every resulting subgraph -- across every sample
+    -- into a single HeteroData batch ready for another forward pass.
 
-    Returns the same four outputs as `build_subproblem`, concatenated across
-    the batch in sample order -- which is also the order `Batch.from_data_
-    list` lays each sample's nodes/edges out in, so `bus_map`/`voltage_mask`/
+    Returns the same four outputs as `build_subproblem`, concatenated in
+    the order the subgraphs were generated (sample-major, and within a
+    sample in draw order) -- which is also the order `Batch.from_data_list`
+    lays each subgraph's nodes/edges out in, so `bus_map`/`voltage_mask`/
     `edge_map` can be indexed directly against a subsequent forward pass on
-    the returned `sub_data`.
+    the returned `sub_data`. Nothing downstream needs to know which
+    subgraphs came from the same original sample -- e.g. `SubproblemConsistencyLoss`'s
+    per-subgraph loss pooling treats every subgraph as its own independent
+    unit regardless of provenance (see `_per_subgraph_mse`), and with a
+    fixed `subgraphs_per_sample` applied uniformly to every sample, that's
+    equivalent to weighting by original sample anyway (each sample
+    contributes the same subgraph count, so a flat mean over all subgraphs
+    already gives every sample equal total weight).
 
     Parameters
     ----------
@@ -719,8 +741,11 @@ def build_subproblem_batch(
     output_dict : dict
         See `build_subproblem`.
     min_size, max_size : int
-        Per-sample subgraph size bounds (absolute bus counts), passed to
-        `sample_bus_subset`.
+        Per-subgraph size bounds (absolute bus counts), passed to
+        `sample_bus_subset`. Applied independently to every draw -- with
+        `subgraphs_per_sample > 1`, a single original sample's own draws
+        can land at different sizes within the same [min_size, max_size]
+        range.
     add_bus_type : bool, optional
         See `build_subproblem`.
     detach_teacher : bool
@@ -753,6 +778,13 @@ def build_subproblem_batch(
         How often (in calls with a shape-matching cache) to pay for a full
         `torch.equal` re-verification instead of trusting the cache
         outright. Default 200. Irrelevant if `adjacency_cache` is None.
+    subgraphs_per_sample : int, optional
+        How many independent subgraphs to draw per original sample in
+        `data` (default 1, matching the original single-subgraph-per-
+        sample behavior). Each is its own independent BFS draw (own seed
+        bus, own size sampled from [min_size, max_size]) -- memory/compute
+        for the resulting `sub_data` batch scales with the total node/edge
+        count across all of them, same as increasing batch_size would.
     stats : dict, optional
         Opt-in profiling: if given, accumulates wall-clock seconds (summed
         across repeated calls) under keys "adjacency", "sample_bus_subset",
@@ -780,20 +812,24 @@ def build_subproblem_batch(
             )
             if adjacency_cache["calls_since_verify"] < verify_every:
                 adjacency = adjacency_cache["adjacency"]
+                _bump(stats, "adjacency_cache_hit#count")
             elif torch.equal(cached_edge_index, edge_index):
                 adjacency_cache["calls_since_verify"] = 0
                 adjacency = adjacency_cache["adjacency"]
+                _bump(stats, "adjacency_full_verify#count")
             else:
                 adjacency = build_adjacency(edge_index, num_buses)
                 adjacency_cache["edge_index"] = edge_index.detach().clone()
                 adjacency_cache["adjacency"] = adjacency
                 adjacency_cache["calls_since_verify"] = 0
+                _bump(stats, "adjacency_rebuild#count")
         else:
             adjacency = build_adjacency(edge_index, num_buses)
             if adjacency_cache is not None:
                 adjacency_cache["edge_index"] = edge_index.detach().clone()
                 adjacency_cache["adjacency"] = adjacency
                 adjacency_cache["calls_since_verify"] = 0
+            _bump(stats, "adjacency_rebuild#count")
 
     # Sample a connected bus subset per graph. Still a Python loop -- BFS
     # growth is inherently sequential (see sample_bus_subset) and already
@@ -811,10 +847,15 @@ def build_subproblem_batch(
             lo, hi = ptr_list[k], ptr_list[k + 1]
             if hi <= lo:
                 continue
-            seed_bus = torch.randint(lo, hi, (1,), generator=generator).item()
-            bus_subset_list.append(
-                sample_bus_subset(adjacency, seed_bus, min_size, max_size, generator=generator)
-            )
+            # subgraphs_per_sample independent draws per original sample --
+            # own seed bus and own BFS growth each time, so within one
+            # sample the draws aren't just copies of each other (nothing
+            # here shares state between draws besides the RNG stream).
+            for _ in range(subgraphs_per_sample):
+                seed_bus = torch.randint(lo, hi, (1,), generator=generator).item()
+                bus_subset_list.append(
+                    sample_bus_subset(adjacency, seed_bus, min_size, max_size, generator=generator)
+                )
 
     with _timed(stats, "build_subproblem"):
         (

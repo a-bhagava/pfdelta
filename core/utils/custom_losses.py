@@ -4,10 +4,41 @@ import torch
 from torch import nn
 from torch.nn.functional import mse_loss
 from torch_geometric.data import HeteroData
+from torch_geometric.nn import global_mean_pool
 
 from core.utils.registry import registry
 from core.utils.pf_losses_utils import PowerBalanceLoss
 from core.utils.create_subproblem import _timed, build_subproblem_batch
+
+
+def _per_subgraph_mse(student: torch.Tensor, teacher: torch.Tensor, batch_idx: torch.Tensor) -> torch.Tensor:
+    """
+    Mean-of-per-subgraph-means squared error, matching how PowerBalanceLoss
+    aggregates (see pf_losses_utils.PowerBalanceLoss.__call__): average
+    within each subgraph first, THEN average across subgraphs -- so neither
+    a subgraph with more rows (bigger subgraph) nor a subgraph that simply
+    appears more times in the batch gets more weight than any other
+    subgraph just by having more rows to average over.
+
+    Unlike PowerBalanceLoss's own `.mean()` (safe there because every
+    sample in a full-grid batch always has at least one bus), this
+    explicitly restricts the final mean to subgraphs that actually
+    contributed at least one row (`batch_idx.unique()`) rather than
+    trusting global_mean_pool's implicit zero-fill for absent groups --
+    a subgraph CAN legitimately contribute zero rows here (e.g. a
+    single-bus subgraph whose only bus got promoted to local slack, so
+    voltage_mask excludes it entirely -- see build_subproblem), and
+    counting that as a fabricated zero-error entry would silently dilute
+    the mean with a comparison that never happened.
+    """
+    if student.numel() == 0:
+        return torch.zeros((), device=student.device)
+    sq_err = (student - teacher) ** 2
+    if sq_err.dim() > 1:
+        sq_err = sq_err.mean(dim=-1)
+    per_subgraph = global_mean_pool(sq_err, batch_idx)
+    present = batch_idx.unique()
+    return per_subgraph[present].mean()
 
 
 def loss_loader(class_name, class_inputs, class_type):
@@ -225,11 +256,20 @@ class SubproblemConsistencyLoss:
         pbl_weight=0.0,
         seed=None,
         profile=False,
+        subgraphs_per_sample=1,
     ):
         self.model = None
         self.min_size = min_size
         self.max_size = max_size
         self.detach_teacher = detach_teacher
+        # How many independent subgraphs to cut per original sample, each
+        # its own random draw -- see build_subproblem_batch's own docstring
+        # for what this does and doesn't cost. Every loss component below
+        # is pooled per-subgraph before being averaged (see
+        # _per_subgraph_mse/PowerBalanceLoss's own aggregation), so with
+        # this applied uniformly across the batch, a sample doesn't get
+        # more total weight just because it contributed more subgraphs.
+        self.subgraphs_per_sample = subgraphs_per_sample
         self.voltage_weight = voltage_weight
         self.injection_weight = injection_weight
         self.edge_weight = edge_weight
@@ -269,6 +309,7 @@ class SubproblemConsistencyLoss:
             detach_teacher=self.detach_teacher,
             generator=self.generator,
             adjacency_cache=self._adjacency_cache,
+            subgraphs_per_sample=self.subgraphs_per_sample,
             stats=self.timings,
         )
         with _timed(self.timings, "second_forward"):
@@ -283,6 +324,15 @@ class SubproblemConsistencyLoss:
             self.pbl_loss = self._pbl(sub_outputs, sub_data)
 
         with _timed(self.timings, "loss_compute"):
+            # Per-subgraph batch index, for _per_subgraph_mse below -- every
+            # component is averaged per subgraph first, then across
+            # subgraphs (matching PowerBalanceLoss's own aggregation), so a
+            # bigger subgraph (more rows/edges to average over, since sizes
+            # are sampled independently per subgraph from [min_size,
+            # max_size]) doesn't get more weight than a smaller one just by
+            # contributing more terms to what used to be a flat mean.
+            bus_batch = sub_data["bus"].batch
+
             # Bus voltages: skip any promoted local-slack rows, since their
             # (va, vm) is an echoed input on the subproblem side, not a prediction.
             teacher_bus = outputs["bus"][bus_map][voltage_mask]
@@ -296,7 +346,7 @@ class SubproblemConsistencyLoss:
             teacher_bus = torch.stack([teacher_va, teacher_bus[:, 1]], dim=-1)
             if self.detach_teacher:
                 teacher_bus = teacher_bus.detach()
-            self.voltage_loss = mse_loss(student_bus, teacher_bus)
+            self.voltage_loss = _per_subgraph_mse(student_bus, teacher_bus, bus_batch[voltage_mask])
 
             # Net bus injections (P, Q). A genuine prediction on either side
             # whenever that bus is PV/slack there; a harmless (~0) echoed-input
@@ -311,18 +361,19 @@ class SubproblemConsistencyLoss:
             student_net = torch.stack([Pnet_s, Qnet_s], dim=-1)
             if self.detach_teacher:
                 teacher_net = teacher_net.detach()
-            self.injection_loss = mse_loss(student_net, teacher_net)
+            self.injection_loss = _per_subgraph_mse(student_net, teacher_net, bus_batch)
 
             # Interior branch flows (lines kept on both sides of the cut).
+            # Edges don't get their own `.batch` from Batch.from_data_list --
+            # derive one from their source bus's own subgraph id (block-
+            # diagonal batching means an edge never crosses subgraphs, so
+            # its source bus's subgraph id is exactly its own).
             teacher_edges = outputs["edge_preds"][edge_map]
             student_edges = sub_outputs["edge_preds"]
             if self.detach_teacher:
                 teacher_edges = teacher_edges.detach()
-            self.edge_loss = (
-                mse_loss(student_edges, teacher_edges)
-                if student_edges.numel() > 0
-                else torch.zeros((), device=student_bus.device)
-            )
+            edge_src = sub_data["bus", "branch", "bus"].edge_index[0]
+            self.edge_loss = _per_subgraph_mse(student_edges, teacher_edges, bus_batch[edge_src])
 
             self.loss = (
                 self.voltage_weight * self.voltage_loss
