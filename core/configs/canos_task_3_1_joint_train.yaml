@@ -82,7 +82,7 @@ dataset:
 functional:
   checkpoint: True  # matches canos_task_1_3.yaml -- worth it over 200 epochs
   run_location: canos_task_3_1_joint_train
-  run_name: canos_k_steps15_hd256_lr1e-3_sgband_%min_size_w_sg_cons%w_sg_cons_w_sg_pbl%w_sg_pbl_task_3_1_joint
+  run_name: canos_k_steps%k_steps_hd256_lr%lr_w_sg_pbl%w_sg_pbl_task_3_1_joint
   is_debug: false
   seed: 11
   cpu: false
@@ -100,7 +100,7 @@ model:
   dataset: _include_
   hidden_dim: 256  # fixed (not swept) -- matches the checkpoint
   include_sent_messages: true
-  k_steps: 15      # canos_task_3_1_finetune.yaml warm-starts from, so the
+  k_steps: _manual_list(15, 20 | 15, 20)      # canos_task_3_1_finetune.yaml warm-starts from, so the
                     # two configs are directly comparable. No pretrained_path
                     # here -- trains from GNNTrainer's normal (random) init.
   name: canos_pf
@@ -120,9 +120,7 @@ optim:
       name: StepLR
       step_size: 4
   optimizer:
-    lr: 0.001  # fixed at canos_task_1_3.yaml's higher swept value (not
-               # swept here -- combined with sgband/consw/pblw below would
-               # multiply the already-12-job sweep further)
+    lr: _manual_list(0.001, 0.0003 | 1e-3, 3e-4)
     name: Adam
     weight_decay: 0.0
   train_params:
@@ -153,8 +151,8 @@ optim:
         # whichever sweep's substitution runs first, silently hiding the
         # other). The decoy's own key must be UNIQUE too -- naming both
         # decoys "weight_label" would hit this exact same collision again.
-        weight: _connected_list(consw -- 0.01, 0.1 | 0.01, 0.1)
-        w_sg_cons: _connected_list(consw -- 0.01, 0.1 | 0.01, 0.1)
+        weight: 0 # _connected_list(consw -- 0.01, 0.1 | 0.01, 0.1)
+        w_sg_cons: 0 #_connected_list(consw -- 0.01, 0.1 | 0.01, 0.1)
         inputs:
           # min_size/max_size vary together (paired, not cross-producted) across
           # three size bands -- two tight ones (case30, case118), plus a "wide"
@@ -162,8 +160,8 @@ optim:
           # subgraph sizes transfers better overall than specializing to one
           # target size. Shares the "sgband" key with case_name/use_first_only
           # above and below (must all stay the same length).
-          min_size: _connected_list(sgband -- 24, 100, 10 | 30, 118, wide)
-          max_size: _connected_list(sgband -- 36, 136, 136 | 30, 118, wide)
+          min_size: _connected_list(sgband -- 10 | wide)
+          max_size: _connected_list(sgband -- 125 | wide)
           # 4 independent subgraph draws per case500 sample per step (own
           # seed bus/BFS growth each -- see build_subproblem_batch), instead
           # of just 1. Fixed here, not swept -- change to a
@@ -190,8 +188,8 @@ optim:
         # key, independent of consw/sgband -- see the comment on w2 above for
         # why subgraph_pbl_weight_label (a second, identically-swept, but
         # UNIQUELY NAMED key) exists at all.
-        weight: _connected_list(pblw -- 0.1, 1 | 0.1, 1)
-        w_sg_pbl: _connected_list(pblw -- 0.1, 1 | 0.1, 1)
+        weight: _connected_list(pblw -- 1, 10 | 1, 10)
+        w_sg_pbl: _connected_list(pblw -- 1, 10 | 1, 10)
         inputs:
           recycled_parameter: pbl_loss
           loss_name: "Subgraph power balance"
@@ -222,11 +220,7 @@ optim:
     # Re-enabled (commented out in the finetune config, since an 80-epoch
     # finetune from an already-good checkpoint doesn't need it) -- a
     # 200-epoch from-scratch run does, matching canos_task_1_3.yaml.
-    early_stop:
-      decrease_by: 0.01
-      decrease_for: 20
-      needs_best_every: 30
-    report_every: 2
+    report_every: 1
     val_loss:
     - model: CANOS
       name: universal_power_balance
@@ -242,8 +236,8 @@ optim:
     # component above, so each job evaluates consistency at whatever size
     # band/subgraph count it's actually training at.
     - name: subproblem_consistency
-      min_size: _connected_list(sgband -- 24, 100, 10 | 30, 118, wide)
-      max_size: _connected_list(sgband -- 36, 136, 136 | 30, 118, wide)
+      min_size: _connected_list(sgband -- 10 | wide)
+      max_size: _connected_list(sgband -- 125 | wide)
       subgraphs_per_sample: 4
       detach_teacher: true
       voltage_weight: 1.0
