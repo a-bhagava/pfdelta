@@ -4,8 +4,8 @@ job_parameters:
   # routing anymore (that's what the "sgband" connect key elsewhere in this
   # file is for -- min_size/max_size/case_name/use_first_only/the two loss
   # weights below all share it and must stay the same length).
-  p: mit_normal_gpu,mit_preemptable,pi_donti_gpu
-  gres: gpu:h200:1
+  p: mit_normal_gpu,mit_preemptable
+  gres: gpu:l40s:1
   requeue: __novalue__
   body: "source ~/.bashrc\nconda activate pfdelta2\nexec __launch__"
   mem: 64G
