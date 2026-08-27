@@ -77,12 +77,162 @@ def build_adjacency(edge_index: torch.Tensor, num_nodes: int) -> list:
     return adjacency
 
 
+def _canonical_edge_keys(src: torch.Tensor, dst: torch.Tensor, num_nodes_per_case: int) -> torch.Tensor:
+    """Order-independent per-edge integer key (so (i,j) and (j,i) collide),
+    for set operations over undirected edges."""
+    lo = torch.minimum(src, dst)
+    hi = torch.maximum(src, dst)
+    return lo * num_nodes_per_case + hi
+
+
+def update_base_topology_cache(
+    edge_index: torch.Tensor,
+    ptr: torch.Tensor,
+    num_nodes_per_case: int,
+    base_cache: dict,
+) -> bool:
+    """
+    Maintains `base_cache` (a persistent dict, e.g. owned by a long-lived
+    SubproblemConsistencyLoss instance) as the UNION of every distinct
+    branch edge seen across every call -- the "believed full" topology for
+    one case, in a case-LOCAL (0..num_nodes_per_case-1) index space shared
+    across every sample regardless of which of that case's buses it was
+    batched at.
+
+    Exists because contingency samples (N-1/N-2 -- see the `perturbation`
+    parameter on core.datasets.pfdelta_dataset.PFDeltaDataset) each carry
+    only THEIR OWN active branches, so a batch's total edge count/shape
+    essentially never repeats between batches -- a plain per-batch
+    adjacency cache (comparing whole-batch edge_index tensors) was
+    observed hitting its expensive rebuild path on ~95% of calls as a
+    result. But the underlying topology any one contingency is a small
+    (1-2 branch) deviation FROM is the SAME fixed case every time, and a
+    single batch of samples already covers nearly all of it (a given
+    branch is only offline in a small fraction of scenarios) -- so this
+    converges almost immediately (usually the very first batch) and then
+    rarely changes again, at which point per-batch cost drops to a few
+    cheap vectorized set-membership checks instead of a full Python-loop
+    rebuild over the whole batch's edges every time.
+
+    Correctness doesn't depend on how fast this converges -- any later
+    batch that reveals a not-yet-seen branch (e.g. a rare contingency
+    combination the first several batches happened not to include) simply
+    triggers another (still cheap, bounded by num_nodes_per_case's own
+    edge count, not batch size) rebuild; efficiency does, but real
+    datasets converge fast since a branch has to be simultaneously offline
+    in EVERY sample of EVERY batch seen so far to still be missing.
+
+    Populates/refreshes `base_cache["base_keys"]` (sorted unique canonical
+    edge keys, LOCAL) and `base_cache["base_adjacency"]` (list[list[int]],
+    size num_nodes_per_case, LOCAL indices) in place.
+
+    Returns
+    -------
+    bool
+        True if the base topology actually changed this call (i.e. a
+        previously-unseen branch was discovered) -- for profiling/counters,
+        not required for correctness.
+    """
+    src, dst = edge_index[0], edge_index[1]
+    # Which original sample each edge belongs to -- block-diagonal batching
+    # means an edge's two endpoints always share a sample, so its source
+    # bus's sample id is exactly its own.
+    sample_id = torch.bucketize(src, ptr[1:], right=True)
+    local_src = src - ptr[sample_id]
+    local_dst = dst - ptr[sample_id]
+    batch_keys = _canonical_edge_keys(local_src, local_dst, num_nodes_per_case)
+
+    base_keys = base_cache.get("base_keys")
+    if base_keys is None:
+        new_keys = torch.unique(batch_keys)
+        changed = True
+    else:
+        unseen = batch_keys[~torch.isin(batch_keys, base_keys)]
+        changed = bool(unseen.numel() > 0)
+        new_keys = torch.unique(torch.cat([base_keys, unseen])) if changed else base_keys
+
+    if changed:
+        base_cache["base_keys"] = new_keys
+        lo_list = (new_keys // num_nodes_per_case).tolist()
+        hi_list = (new_keys % num_nodes_per_case).tolist()
+        adjacency = [[] for _ in range(num_nodes_per_case)]
+        for i, j in zip(lo_list, hi_list):
+            adjacency[i].append(j)
+            adjacency[j].append(i)
+        base_cache["base_adjacency"] = adjacency
+        base_cache["num_nodes_per_case"] = num_nodes_per_case
+    return changed
+
+
+def missing_edges_per_sample(
+    edge_index: torch.Tensor,
+    ptr: torch.Tensor,
+    num_nodes_per_case: int,
+    base_cache: dict,
+) -> list:
+    """
+    For each sample in a batch, which of the cached base topology's edges
+    (see `update_base_topology_cache`, which MUST be called first on this
+    same `edge_index`/`ptr` so `base_cache` actually covers every edge this
+    batch could be missing) are absent from that sample's own active
+    branches -- i.e. that sample's own contingency-removed lines, as
+    (local_i, local_j) pairs. Vectorized across the whole batch at once
+    (no per-sample/per-edge Python loop).
+
+    Returns
+    -------
+    list[list[tuple[int, int]]]
+        One list per sample (in ptr order), each a short list of (local_i,
+        local_j) pairs missing for that sample -- empty for a sample with
+        every base branch active.
+    """
+    base_keys = base_cache["base_keys"]
+    num_samples = ptr.numel() - 1
+    num_base_edges = base_keys.numel()
+
+    src, dst = edge_index[0], edge_index[1]
+    sample_id = torch.bucketize(src, ptr[1:], right=True)
+    local_src = src - ptr[sample_id]
+    local_dst = dst - ptr[sample_id]
+    batch_keys = _canonical_edge_keys(local_src, local_dst, num_nodes_per_case)
+
+    # Position of each batch edge within the sorted base_keys tensor --
+    # a real position (not just an insertion point) precisely because
+    # update_base_topology_cache guarantees every batch_keys entry is
+    # already present in base_keys by the time this runs.
+    positions = torch.searchsorted(base_keys, batch_keys)
+    assert torch.equal(base_keys[positions], batch_keys), (
+        "missing_edges_per_sample: batch_keys not covered by base_keys -- "
+        "update_base_topology_cache must run first on this same batch."
+    )
+
+    present = torch.zeros(
+        num_samples, num_base_edges, dtype=torch.bool, device=edge_index.device
+    )
+    present[sample_id, positions] = True
+    missing_mask = ~present
+
+    base_keys_cpu = base_keys.tolist()
+    result = []
+    for k in range(num_samples):
+        missing_positions = missing_mask[k].nonzero(as_tuple=True)[0].tolist()
+        result.append(
+            [
+                (base_keys_cpu[p] // num_nodes_per_case, base_keys_cpu[p] % num_nodes_per_case)
+                for p in missing_positions
+            ]
+        )
+    return result
+
+
 def sample_bus_subset(
     adjacency: list,
     seed_bus: int,
     min_size,
     max_size,
     generator: Optional[torch.Generator] = None,
+    bus_offset: int = 0,
+    excluded_neighbors: Optional[dict] = None,
 ) -> torch.Tensor:
     """
     Randomly grow a connected subset of buses via BFS from `seed_bus`.
@@ -99,16 +249,31 @@ def sample_bus_subset(
     Parameters
     ----------
     adjacency : list[list[int]]
-        Undirected adjacency list, e.g. from `build_adjacency`. Can be over
-        a batched bus index space -- since batched samples never share
-        edges, growth from a seed inside one sample never crosses into
-        another.
+        Undirected adjacency list. By default (bus_offset=0), indexed by
+        the SAME global bus index space as `seed_bus` -- e.g. from
+        `build_adjacency` over a whole batch, since batched samples never
+        share edges so growth from a seed inside one sample never crosses
+        into another. Can instead be a single SHARED, case-LOCAL (0..
+        num_nodes_per_case-1) adjacency list reused across every sample of
+        that case regardless of each one's own contingency -- pass
+        `bus_offset`/`excluded_neighbors` in that mode; see
+        `update_base_topology_cache`/`missing_edges_per_sample` for why.
     seed_bus : int
         Global bus index to grow the subset from.
     min_size, max_size : int
         Target subset size bounds, as absolute bus counts.
     generator : torch.Generator, optional
         RNG used for the neighbor shuffle and size sampling.
+    bus_offset : int, optional
+        Subtracted from a global bus index before indexing into
+        `adjacency`, added back before visiting/returning -- 0 (a no-op)
+        for a plain global adjacency list. Pass a sample's own `ptr[k]`
+        when `adjacency` is a shared case-local list.
+    excluded_neighbors : dict[int, set[int]], optional
+        Maps a LOCAL node id to the set of LOCAL neighbor ids to skip when
+        traversing that node -- this sample's own missing (contingency-
+        offline) edges, on top of whatever's already absent from
+        `adjacency` itself.
 
     Returns
     -------
@@ -127,10 +292,15 @@ def sample_bus_subset(
     while frontier and len(kept) < target_size:
         next_frontier = []
         for node in frontier:
-            neighbors = adjacency[node]
-            perm = torch.randperm(len(neighbors), generator=generator).tolist()
+            node_local = node - bus_offset
+            neighbors_local = adjacency[node_local]
+            excluded = excluded_neighbors.get(node_local) if excluded_neighbors else None
+            perm = torch.randperm(len(neighbors_local), generator=generator).tolist()
             for idx in perm:
-                neighbor = neighbors[idx]
+                neighbor_local = neighbors_local[idx]
+                if excluded is not None and neighbor_local in excluded:
+                    continue
+                neighbor = neighbor_local + bus_offset
                 if neighbor in visited:
                     continue
                 visited.add(neighbor)
@@ -710,7 +880,6 @@ def build_subproblem_batch(
     detach_teacher: bool = True,
     generator: Optional[torch.Generator] = None,
     adjacency_cache: Optional[dict] = None,
-    verify_every: int = 200,
     subgraphs_per_sample: int = 1,
     stats: Optional[dict] = None,
 ) -> tuple:
@@ -754,30 +923,21 @@ def build_subproblem_batch(
         RNG for reproducible sampling.
     adjacency_cache : dict, optional
         Reused across calls (e.g. one dict owned by a long-lived
-        SubproblemConsistencyLoss instance) to skip rebuilding the adjacency
-        list when the branch topology hasn't changed since the last call --
-        common when every sample is drawn from the same case with no
-        contingency perturbation, so the topology is identical run-to-run
-        and only the demand/generation values vary. Self-verifying, but only
-        every `verify_every` calls (not every single one): on a shape match
-        it's trusted without a full `torch.equal` most of the time, since on
-        GPU tensors that comparison forces a device sync -- and because
-        PyTorch dispatches CUDA work asynchronously, that sync doesn't just
-        cost the comparison itself, it blocks on everything queued before it
-        (the model's own forward pass, any preceding loss computation),
-        which otherwise wouldn't actually be waited on until something later
-        forces a sync anyway. Doing that every call was misattributing most
-        of a training step's real GPU time to this cache check. A shape
-        *mismatch* (e.g. a genuinely different case) is always caught
-        immediately and triggers an unconditional rebuild + re-verify,
-        regardless of `verify_every` -- only a same-shape-but-different-
-        content change (topology drift with an identical bus/edge count,
-        which nothing else in this pipeline currently produces) could go
-        undetected for up to `verify_every` calls.
-    verify_every : int, optional
-        How often (in calls with a shape-matching cache) to pay for a full
-        `torch.equal` re-verification instead of trusting the cache
-        outright. Default 200. Irrelevant if `adjacency_cache` is None.
+        SubproblemConsistencyLoss instance) as the base-topology cache for
+        `update_base_topology_cache`/`missing_edges_per_sample` -- samples
+        can each carry their own N-1/N-2 contingency (a small, per-sample
+        deviation from a shared fixed topology; see the `perturbation`
+        parameter on PFDeltaDataset), so caching a whole batch's adjacency
+        wholesale doesn't help (a batch's total edge count/shape
+        essentially never repeats). Instead this caches the UNION topology
+        for the case ONCE (converges after the first batch or so) and
+        tracks each sample's own small missing-edge patch against it,
+        applied on the fly during BFS growth rather than rebuilt from
+        scratch per sample. Only used when every sample in the batch has
+        the same bus count (`ptr` differences all equal) -- true for any
+        single case, contingency or not, since N-1/N-2 only removes
+        branches, never buses. Falls back to a plain (uncached) full
+        rebuild via `build_adjacency` otherwise, or if this is None.
     subgraphs_per_sample : int, optional
         How many independent subgraphs to draw per original sample in
         `data` (default 1, matching the original single-subgraph-per-
@@ -803,33 +963,30 @@ def build_subproblem_batch(
 
     edge_index = data["bus", "branch", "bus"].edge_index
     with _timed(stats, "adjacency"):
-        cached_edge_index = (
-            adjacency_cache.get("edge_index") if adjacency_cache is not None else None
+        sample_sizes = ptr[1:] - ptr[:-1]
+        num_nodes_per_case = int(sample_sizes[0].item()) if sample_sizes.numel() > 0 else num_buses
+        uniform_case_size = bool(
+            sample_sizes.numel() == 0 or bool((sample_sizes == num_nodes_per_case).all().item())
         )
-        if cached_edge_index is not None and cached_edge_index.shape == edge_index.shape:
-            adjacency_cache["calls_since_verify"] = (
-                adjacency_cache.get("calls_since_verify", 0) + 1
+
+        if adjacency_cache is not None and uniform_case_size:
+            changed = update_base_topology_cache(edge_index, ptr, num_nodes_per_case, adjacency_cache)
+            if changed:
+                _bump(stats, "adjacency_base_updated#count")
+            per_sample_missing = missing_edges_per_sample(
+                edge_index, ptr, num_nodes_per_case, adjacency_cache
             )
-            if adjacency_cache["calls_since_verify"] < verify_every:
-                adjacency = adjacency_cache["adjacency"]
-                _bump(stats, "adjacency_cache_hit#count")
-            elif torch.equal(cached_edge_index, edge_index):
-                adjacency_cache["calls_since_verify"] = 0
-                adjacency = adjacency_cache["adjacency"]
-                _bump(stats, "adjacency_full_verify#count")
-            else:
-                adjacency = build_adjacency(edge_index, num_buses)
-                adjacency_cache["edge_index"] = edge_index.detach().clone()
-                adjacency_cache["adjacency"] = adjacency
-                adjacency_cache["calls_since_verify"] = 0
-                _bump(stats, "adjacency_rebuild#count")
+            base_adjacency = adjacency_cache["base_adjacency"]
+            use_base_mode = True
+            _bump(stats, "adjacency_base_mode#count")
         else:
+            # Irregular batch (different bus counts per sample -- shouldn't
+            # happen for a single fixed case, but stay safe) or no cache
+            # requested at all: one flat rebuild for this whole batch, no
+            # caching across calls.
             adjacency = build_adjacency(edge_index, num_buses)
-            if adjacency_cache is not None:
-                adjacency_cache["edge_index"] = edge_index.detach().clone()
-                adjacency_cache["adjacency"] = adjacency
-                adjacency_cache["calls_since_verify"] = 0
-            _bump(stats, "adjacency_rebuild#count")
+            use_base_mode = False
+            _bump(stats, "adjacency_fallback_rebuild#count")
 
     # Sample a connected bus subset per graph. Still a Python loop -- BFS
     # growth is inherently sequential (see sample_bus_subset) and already
@@ -847,6 +1004,19 @@ def build_subproblem_batch(
             lo, hi = ptr_list[k], ptr_list[k + 1]
             if hi <= lo:
                 continue
+            if use_base_mode:
+                # This sample's own missing-edge patch against the shared
+                # base topology (see missing_edges_per_sample) -- symmetric
+                # since undirected, and typically 0-2 entries (N-1/N-2).
+                excluded: dict = {}
+                for i, j in per_sample_missing[k]:
+                    excluded.setdefault(i, set()).add(j)
+                    excluded.setdefault(j, set()).add(i)
+                sample_kwargs = dict(
+                    adjacency=base_adjacency, bus_offset=lo, excluded_neighbors=excluded
+                )
+            else:
+                sample_kwargs = dict(adjacency=adjacency)
             # subgraphs_per_sample independent draws per original sample --
             # own seed bus and own BFS growth each time, so within one
             # sample the draws aren't just copies of each other (nothing
@@ -854,7 +1024,13 @@ def build_subproblem_batch(
             for _ in range(subgraphs_per_sample):
                 seed_bus = torch.randint(lo, hi, (1,), generator=generator).item()
                 bus_subset_list.append(
-                    sample_bus_subset(adjacency, seed_bus, min_size, max_size, generator=generator)
+                    sample_bus_subset(
+                        seed_bus=seed_bus,
+                        min_size=min_size,
+                        max_size=max_size,
+                        generator=generator,
+                        **sample_kwargs,
+                    )
                 )
 
     with _timed(stats, "build_subproblem"):

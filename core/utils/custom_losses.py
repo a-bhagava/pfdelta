@@ -282,9 +282,12 @@ class SubproblemConsistencyLoss:
         self._pbl = PowerBalanceLoss(model="CANOS")
         self.loss_name = "Subproblem consistency"
         # Persists for the life of this loss instance (one per training run)
-        # so build_subproblem_batch can skip rebuilding the adjacency list
-        # when the branch topology hasn't changed since the last call -- see
-        # its adjacency_cache docstring.
+        # as the base-topology cache build_subproblem_batch maintains
+        # across calls (see its adjacency_cache / update_base_topology_
+        # cache docstrings) -- lets it track each sample's own small
+        # contingency (N-1/N-2) deviation from a shared base topology
+        # instead of rebuilding a whole adjacency list from scratch nearly
+        # every call.
         self._adjacency_cache = {}
         # Opt-in profiling: accumulates wall-clock seconds (summed across
         # repeated calls) under "build_subproblem_batch" (itself broken down
