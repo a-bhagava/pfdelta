@@ -150,6 +150,13 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         self._profiled_losses = []
         for loss in list(self.train_loss) + list(self.val_loss):
             self._collect_profiled_losses(loss)
+        # Opt-in, tied to the SAME signal as everything else (whether any
+        # loss entry set profile: true) -- GNNTrainer.train_one_epoch reads
+        # this attribute (via getattr, defaulting to None -- a no-op) to
+        # time the first (full-grid) forward pass, which otherwise happens
+        # before any train_loss entry even runs and so was invisible to
+        # every other profiling hook here.
+        self._forward_pass_timings = {} if self._profiled_losses else None
 
     def calc_one_val_error(self, val_dataloader, val_num):
         consistency_val_indices = self.config["functional"].get(
@@ -205,12 +212,18 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         super().setup_pre_epoch()
         for loss in self._profiled_losses:
             loss.timings.clear()
+        if self._forward_pass_timings is not None:
+            self._forward_pass_timings.clear()
 
     def setup_post_epoch(self):
         super().setup_post_epoch()
         if not self._profiled_losses:
             return
         print(f"\n\U000023f1️  Profiling summary (epoch {self.epoch + 1}):")
+        if self._forward_pass_timings:
+            print("  [First forward pass]")
+            for key, seconds in self._forward_pass_timings.items():
+                print(f"    {key:<24}: {seconds:.3f}s")
         for loss in self._profiled_losses:
             label = getattr(loss, "loss_name", type(loss).__name__)
             print(f"  [{label}]")

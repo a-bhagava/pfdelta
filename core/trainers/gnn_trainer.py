@@ -7,6 +7,7 @@ import torch
 from torch_geometric.loader.dataloader import DataLoader
 
 from core.trainers.base_trainer import BaseTrainer
+from core.utils.create_subproblem import _timed
 from core.utils.registry import registry
 
 
@@ -21,6 +22,15 @@ class GNNTrainer(BaseTrainer):
         running_loss = [0.0] * len(self.train_loss)
         losses = [0.0] * len(self.train_loss)
         message = f"Epoch {self.epoch + 1} \U0001f3cb"
+        # None (the default for any trainer that doesn't opt in -- see
+        # SubgraphFinetuneTrainer) makes _timed a complete no-op, so this
+        # costs nothing for every other trainer. Named "first_forward_pass"
+        # to read naturally alongside "second_forward" in
+        # SubproblemConsistencyLoss's own profiling -- this is the forward
+        # pass that produces the `outputs` every train_loss entry (PBL, the
+        # subgraph-consistency augmentation's teacher pass, etc.) actually
+        # runs on.
+        forward_pass_stats = getattr(self, "_forward_pass_timings", None)
         for data in tqdm(train_dataloader, desc=message):
             # Copy data in case models overwrite inputs
             data = copy.deepcopy(data)
@@ -29,7 +39,8 @@ class GNNTrainer(BaseTrainer):
 
             # Calculate output and loss
             self.optimizer.zero_grad()
-            outputs = self.model(data)
+            with _timed(forward_pass_stats, "first_forward_pass"):
+                outputs = self.model(data)
             for i, loss_func in enumerate(self.train_loss):
                 losses[i] = loss_func(outputs, data)
                 running_loss[i] += losses[i].item()

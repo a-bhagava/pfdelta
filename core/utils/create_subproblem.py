@@ -29,12 +29,13 @@ turns it into a self-training/pseudo-label signal that needs no ground
 truth on the target topology.
 """
 
+import random as pyrandom
 import time
 from contextlib import contextmanager
 from typing import Optional
 
 import torch
-from torch_geometric.data import Batch, HeteroData
+from torch_geometric.data import HeteroData
 
 
 @contextmanager
@@ -263,7 +264,8 @@ def sample_bus_subset(
     min_size, max_size : int
         Target subset size bounds, as absolute bus counts.
     generator : torch.Generator, optional
-        RNG used for the neighbor shuffle and size sampling.
+        RNG used for size sampling and to seed this call's own local
+        (plain-Python) RNG for neighbor shuffling -- see below.
     bus_offset : int, optional
         Subtracted from a global bus index before indexing into
         `adjacency`, added back before visiting/returning -- 0 (a no-op)
@@ -284,6 +286,19 @@ def sample_bus_subset(
     lo, hi = min(lo, hi), max(lo, hi)
     target_size = torch.randint(lo, hi + 1, (1,), generator=generator).item()
 
+    # One draw from the shared torch.Generator seeds a plain-Python RNG for
+    # this call's OWN traversal -- advances `generator`'s state exactly
+    # once (keeping the overall stream reproducible given a fixed top-level
+    # seed), while avoiding a `torch.randperm` tensor allocation + kernel
+    # dispatch for EVERY node visited during growth (up to `target_size` of
+    # them, times however many subgraphs are drawn per sample) -- that
+    # per-call overhead, not the shuffling itself, was the actual cost:
+    # `random.shuffle` on the plain neighbor list has none of it and is
+    # markedly cheaper for the small (single-digit to a few dozen)
+    # neighbor lists BFS actually shuffles here.
+    local_seed = torch.randint(0, 2**31 - 1, (1,), generator=generator).item()
+    rng = pyrandom.Random(local_seed)
+
     # Grow the BFS, shuffling each shell, stopping once the target size is
     # hit -- so repeated calls from the same seed still vary.
     visited = {seed_bus}
@@ -295,9 +310,9 @@ def sample_bus_subset(
             node_local = node - bus_offset
             neighbors_local = adjacency[node_local]
             excluded = excluded_neighbors.get(node_local) if excluded_neighbors else None
-            perm = torch.randperm(len(neighbors_local), generator=generator).tolist()
-            for idx in perm:
-                neighbor_local = neighbors_local[idx]
+            shuffled_neighbors = neighbors_local[:]
+            rng.shuffle(shuffled_neighbors)
+            for neighbor_local in shuffled_neighbors:
                 if excluded is not None and neighbor_local in excluded:
                     continue
                 neighbor = neighbor_local + bus_offset
@@ -626,13 +641,15 @@ def _build_subproblem_vectorized(
     `test_adjacency_cache`-style equivalence test referenced in the module
     history for how this was verified.
 
+    Builds the final batched `sub_data` directly from the union tensors --
+    no per-subgraph Python loop, no `Batch.from_data_list`. See the inline
+    comment above the assembly code for why this is a safe (not just
+    faster) replacement for this codebase's specific consumption pattern.
+
     Returns
     -------
-    sub_data_list : list[HeteroData]
-        One per sample (sliced back out of the vectorized union results),
-        ready for `Batch.from_data_list` -- still delegated to PyG's own
-        tested machinery for the actual ptr/batch/edge-increment batch
-        bookkeeping rather than reimplementing it by hand.
+    sub_data : HeteroData
+        The full batch, ready for another forward pass.
     bus_map, voltage_mask, edge_map, va_offset : torch.Tensor
         Concatenated across the batch in the same sample order as
         `bus_subset_list`; see `build_subproblem`.
@@ -781,94 +798,84 @@ def _build_subproblem_vectorized(
     )
     edge_map_all = interior_mask.nonzero(as_tuple=True)[0]
 
-    # Per-sample edge counts -- recovered the same way bus counts were
-    # (edge_index_sub is already sample-major, since new_src/new_dst are),
-    # needed to slice edge_index_sub/edge_attr_sub back apart below (edge
-    # counts vary independently of bus counts, so `sizes` alone isn't
-    # enough).
-    edge_sample_id = sample_id_sub[new_src]
-    edge_sizes = torch.zeros(num_samples, dtype=torch.long, device=device)
-    edge_sizes.scatter_add_(0, edge_sample_id, torch.ones_like(edge_sample_id))
-    edge_sizes_list = edge_sizes.tolist()
+    # ---- Assemble the final batched sub_data DIRECTLY from the union
+    # tensors above -- no per-subgraph Python loop, no Batch.from_data_list.
+    # This works with no extra bookkeeping because bus_subset_list is
+    # concatenated sample-major, so every union tensor above is ALREADY
+    # laid out exactly the way a properly batched object's own tensors
+    # would be: `new_src`/`new_dst` (via `new_index`) are already GLOBAL
+    # row indices into this same union "bus" numbering (no per-subgraph
+    # offset subtraction needed, unlike the old per-sample-sliced version),
+    # and a node-type mask's own `.nonzero()` over the union already comes
+    # out in the same sample-major order Batch.from_data_list would
+    # produce. The one thing that DOES need computing is each node type's
+    # own `.ptr`/`.batch` (used by e.g. PowerBalanceLoss's global_mean_pool
+    # and by SubproblemConsistencyLoss's own per-subgraph loss pooling) --
+    # only ever consumed as plain tensor attributes here (see
+    # SubproblemConsistencyLoss/PowerBalanceLoss/canos_utils -- none of
+    # them call a Batch-specific method like .to_data_list()/.get_example()
+    # /.num_graphs), so a plain HeteroData with these set by hand is
+    # functionally identical to what Batch.from_data_list would have
+    # returned for our purposes, without spending time reproducing its
+    # full internal bookkeeping.
+    ptr_sub = torch.cat([torch.zeros(1, dtype=torch.long, device=device), sizes_t.cumsum(0)])
 
-    # ---- Slice the vectorized union results back into per-sample HeteroData
-    # objects. Still a Python loop, but every op in it is a cheap tensor
-    # slice/construction -- none of it forces a GPU sync the way the old
-    # per-sample loop's `bool(...)`/`.item()` calls did, so the GPU queue
-    # never blocks waiting on the CPU between iterations. ----
-    sub_data_list = []
-    bus_offset = 0
-    edge_offset = 0
-    for k in range(num_samples):
-        n_k = sizes[k]
-        e_k = edge_sizes_list[k]
-        bus_slice = slice(bus_offset, bus_offset + n_k)
-        edge_slice = slice(edge_offset, edge_offset + e_k)
+    sub_data = HeteroData()
+    sub_data["bus"].x = pf_x
+    sub_data["bus"].num_nodes = n_sub_total
+    sub_data["bus"].ptr = ptr_sub
+    sub_data["bus"].batch = sample_id_sub
+    sub_data["bus"].bus_gen = bus_gen
+    sub_data["bus"].bus_demand = bus_demand
+    sub_data["bus"].bus_voltages = bus_voltages
+    sub_data["bus"].bus_type = bus_type
+    sub_data["bus"].shunt = bus_shunts
+    sub_data["bus"].limits = voltage_limits
 
-        sub_data = HeteroData()
-        sub_data["bus"].x = pf_x[bus_slice]
-        sub_data["bus"].num_nodes = n_k
-        sub_data["bus"].bus_gen = bus_gen[bus_slice]
-        sub_data["bus"].bus_demand = bus_demand[bus_slice]
-        sub_data["bus"].bus_voltages = bus_voltages[bus_slice]
-        sub_data["bus"].bus_type = bus_type[bus_slice]
-        sub_data["bus"].shunt = bus_shunts[bus_slice]
-        sub_data["bus"].limits = voltage_limits[bus_slice]
+    sub_data["bus", "branch", "bus"].edge_index = edge_index_sub
+    sub_data["bus", "branch", "bus"].edge_attr = edge_attr_sub
+    if has_edge_limits:
+        sub_data["bus", "branch", "bus"].edge_limits = edge_limits_sub
 
-        sub_data["bus", "branch", "bus"].edge_index = edge_index_sub[:, edge_slice] - bus_offset
-        sub_data["bus", "branch", "bus"].edge_attr = edge_attr_sub[edge_slice]
-        if has_edge_limits:
-            sub_data["bus", "branch", "bus"].edge_limits = edge_limits_sub[edge_slice]
+    if "gen" in data.node_types or "load" in data.node_types:
+        # _remap_node_type filters data[node_type] down to whichever
+        # entries attach to a kept bus -- calling it ONCE with the UNION
+        # keep_mask/new_index (rather than per-sample) is exactly
+        # equivalent here (disjoint per-sample bus_subsets, same reasoning
+        # as everything else above), since gen/load rows end up ordered by
+        # their OWN link edges' order in `data`, which -- because block-
+        # diagonal batching means a gen/load node only ever links to buses
+        # within its own sample -- already groups sample-major too. Off the
+        # hot path either way: CANOS's own dataset never populates gen/
+        # load (see build_subproblem's own comment), so this only runs for
+        # other dataset variants that do; .ptr/.batch aren't set for these
+        # two types since nothing currently reads them.
+        if "gen" in data.node_types:
+            _remap_node_type(data, sub_data, "gen", "gen_link", keep_mask, new_index)
+        if "load" in data.node_types:
+            _remap_node_type(data, sub_data, "load", "load_link", keep_mask, new_index)
 
-        if "gen" in data.node_types or "load" in data.node_types:
-            # _remap_node_type filters data[node_type] down to whichever
-            # entries attach to a KEPT bus -- the global (union) keep_mask/
-            # new_index would incorrectly pull in every OTHER sample's gen/
-            # load nodes too, not just this one's, so scope both to this
-            # sample's own subset instead (off the hot path: CANOS's own
-            # dataset never populates gen/load -- see build_subproblem's
-            # own comment above -- so this only runs for other dataset
-            # variants that do).
-            # Use bus_subset_all's own slice (already migrated to `device`
-            # above), not bus_subset_list[k] directly -- sample_bus_subset
-            # always returns a plain CPU tensor regardless of `data`'s own
-            # device, so indexing a GPU tensor with it would fail exactly
-            # like the bug fixed above for bus_subset_all itself.
-            keep_mask_k = torch.zeros(num_buses, dtype=torch.bool, device=device)
-            keep_mask_k[bus_subset_all[bus_slice]] = True
-            new_index_k = torch.full((num_buses,), -1, dtype=torch.long, device=device)
-            new_index_k[bus_subset_all[bus_slice]] = torch.arange(n_k, device=device)
-            if "gen" in data.node_types:
-                _remap_node_type(data, sub_data, "gen", "gen_link", keep_mask_k, new_index_k)
-            if "load" in data.node_types:
-                _remap_node_type(data, sub_data, "load", "load_link", keep_mask_k, new_index_k)
+    if add_bus_type:
+        type_masks = {"PQ": pq_mask, "PV": pv_mask, "slack": slack_mask}
+        for node_type, mask in type_masks.items():
+            positions = mask.nonzero(as_tuple=True)[0]  # global union "bus" row indices, sample-major
+            type_sample_id = sample_id_sub[positions]
+            sub_data[node_type].x = pf_x[positions]
+            sub_data[node_type].num_nodes = positions.numel()
+            sub_data[node_type].batch = type_sample_id
+            sub_data[node_type].ptr = torch.searchsorted(
+                type_sample_id, torch.arange(num_samples + 1, device=device)
+            )
+            if node_type != "PQ":
+                sub_data[node_type].demand = bus_demand[positions]
+                sub_data[node_type].generation = bus_gen[positions]
+            link_index = torch.stack(
+                [torch.arange(positions.numel(), device=device), positions]
+            )
+            sub_data[node_type, f"{node_type}_link", "bus"].edge_index = link_index
+            sub_data["bus", f"{node_type}_link", node_type].edge_index = link_index.flip(0)
 
-        if add_bus_type:
-            local_pf_x = pf_x[bus_slice]
-            local_bus_demand = bus_demand[bus_slice]
-            local_bus_gen = bus_gen[bus_slice]
-            local_masks = {
-                "PQ": pq_mask[bus_slice],
-                "PV": pv_mask[bus_slice],
-                "slack": slack_mask[bus_slice],
-            }
-            for node_type, mask in local_masks.items():
-                positions = mask.nonzero(as_tuple=True)[0]
-                sub_data[node_type].x = local_pf_x[positions]
-                if node_type != "PQ":
-                    sub_data[node_type].demand = local_bus_demand[positions]
-                    sub_data[node_type].generation = local_bus_gen[positions]
-                link_index = torch.stack(
-                    [torch.arange(positions.numel(), device=device), positions]
-                )
-                sub_data[node_type, f"{node_type}_link", "bus"].edge_index = link_index
-                sub_data["bus", f"{node_type}_link", node_type].edge_index = link_index.flip(0)
-
-        sub_data_list.append(sub_data)
-        bus_offset += n_k
-        edge_offset += e_k
-
-    return sub_data_list, bus_subset_all, voltage_mask, edge_map_all, va_offset
+    return sub_data, bus_subset_all, voltage_mask, edge_map_all, va_offset
 
 
 def build_subproblem_batch(
@@ -948,7 +955,8 @@ def build_subproblem_batch(
     stats : dict, optional
         Opt-in profiling: if given, accumulates wall-clock seconds (summed
         across repeated calls) under keys "adjacency", "sample_bus_subset",
-        "build_subproblem", and "batch_from_data_list" -- see `_timed`.
+        and "build_subproblem" (which now includes the whole batch
+        assembly, not just the transform) -- see `_timed`.
 
     Returns
     -------
@@ -1033,9 +1041,12 @@ def build_subproblem_batch(
                     )
                 )
 
+    # No separate "batch_from_data_list" stage anymore -- _build_subproblem_
+    # vectorized now assembles the final batched sub_data directly, so that
+    # cost (previously its own bucket) is now folded into this one.
     with _timed(stats, "build_subproblem"):
         (
-            sub_data_list,
+            sub_data_batch,
             bus_map_all,
             voltage_mask_all,
             edge_map_all,
@@ -1047,8 +1058,5 @@ def build_subproblem_batch(
             add_bus_type=add_bus_type,
             detach_teacher=detach_teacher,
         )
-
-    with _timed(stats, "batch_from_data_list"):
-        sub_data_batch = Batch.from_data_list(sub_data_list)
 
     return sub_data_batch, bus_map_all, voltage_mask_all, edge_map_all, va_offset_all
