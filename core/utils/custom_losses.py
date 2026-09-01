@@ -1,4 +1,5 @@
 import types
+from typing import Optional
 
 import torch
 from torch import nn
@@ -11,7 +12,42 @@ from core.utils.pf_losses_utils import PowerBalanceLoss
 from core.utils.create_subproblem import _timed, build_subproblem_batch
 
 
-def _per_subgraph_mse(student: torch.Tensor, teacher: torch.Tensor, batch_idx: torch.Tensor) -> torch.Tensor:
+def _group_by_strategy(
+    per_subgraph_values: torch.Tensor,
+    present: torch.Tensor,
+    strategy_per_subgraph: list,
+) -> dict:
+    """
+    Groups an already per-subgraph-pooled tensor (subgraph i's value at
+    `per_subgraph_values[i]`) by which sampling strategy produced each
+    subgraph (`strategy_per_subgraph[i]`, from `build_subproblem_batch`),
+    restricted to `present` (the subgraphs that actually contributed a
+    value -- see `_per_subgraph_mse`'s own docstring on why an absent
+    subgraph must not be silently treated as a zero). Detached: these
+    breakdowns are for logging only, never part of a backpropagated total,
+    so there's no reason to keep them differentiable.
+
+    Returns {strategy_name: mean_value (0-d tensor)} for whichever
+    strategies actually appear among `present` -- a strategy configured
+    with a small proportion can legitimately be entirely absent from one
+    particular call (e.g. none of its draws happened to contribute a row
+    to this specific metric), so callers reading a possibly-missing key
+    (e.g. RecycleLoss, which returns NaN for one) should expect that.
+    """
+    grouped = {}
+    values = per_subgraph_values.detach()
+    for idx in present.tolist():
+        strat = strategy_per_subgraph[idx]
+        grouped.setdefault(strat, []).append(values[idx])
+    return {name: torch.stack(vals).mean() for name, vals in grouped.items()}
+
+
+def _per_subgraph_mse(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    batch_idx: torch.Tensor,
+    strategy_per_subgraph: Optional[list] = None,
+):
     """
     Mean-of-per-subgraph-means squared error, matching how PowerBalanceLoss
     aggregates (see pf_losses_utils.PowerBalanceLoss.__call__): average
@@ -30,15 +66,24 @@ def _per_subgraph_mse(student: torch.Tensor, teacher: torch.Tensor, batch_idx: t
     voltage_mask excludes it entirely -- see build_subproblem), and
     counting that as a fabricated zero-error entry would silently dilute
     the mean with a comparison that never happened.
+
+    If `strategy_per_subgraph` is given (see `build_subproblem_batch`),
+    also returns a per-strategy breakdown (see `_group_by_strategy`) as a
+    second return value -- omitted entirely (single return value, exactly
+    as before) when it's None, so every existing caller is unaffected.
     """
     if student.numel() == 0:
-        return torch.zeros((), device=student.device)
+        overall = torch.zeros((), device=student.device)
+        return (overall, {}) if strategy_per_subgraph is not None else overall
     sq_err = (student - teacher) ** 2
     if sq_err.dim() > 1:
         sq_err = sq_err.mean(dim=-1)
     per_subgraph = global_mean_pool(sq_err, batch_idx)
     present = batch_idx.unique()
-    return per_subgraph[present].mean()
+    overall = per_subgraph[present].mean()
+    if strategy_per_subgraph is None:
+        return overall
+    return overall, _group_by_strategy(per_subgraph, present, strategy_per_subgraph)
 
 
 def loss_loader(class_name, class_inputs, class_type):
@@ -87,8 +132,26 @@ class RecycleLoss:
         self.keyword = keyword
 
     def __call__(self, output_dict, data):
-        recycled_value = getattr(self.source, self.recycled_parameter)
-        return recycled_value
+        # `recycled_parameter` may be a dotted path (e.g.
+        # "per_strategy_loss.random_walk") to reach into a dict-valued
+        # attribute (see SubproblemConsistencyLoss's per-strategy
+        # breakdowns) -- each "." segment after the first is a dict key
+        # lookup rather than a plain attribute. A single plain name (the
+        # existing/common case, e.g. "pbl_loss") is exactly one segment,
+        # so this is unchanged for every config that isn't using this. A
+        # strategy that isn't present in a particular call's breakdown
+        # (e.g. genuinely no draws landed on it that batch) returns NaN
+        # rather than raising -- same "not evaluated here" convention as
+        # SubgraphFinetuneTrainer's own _skip_consistency stand-in.
+        value = self.source
+        for part in self.recycled_parameter.split("."):
+            if isinstance(value, dict):
+                if part not in value:
+                    return torch.tensor(float("nan"))
+                value = value[part]
+            else:
+                value = getattr(value, part)
+        return value
 
 
 @registry.register_loss("combined_loss")
@@ -257,6 +320,7 @@ class SubproblemConsistencyLoss:
         seed=None,
         profile=False,
         subgraphs_per_sample=1,
+        sampling_strategies=None,
     ):
         self.model = None
         self.min_size = min_size
@@ -270,6 +334,13 @@ class SubproblemConsistencyLoss:
         # this applied uniformly across the batch, a sample doesn't get
         # more total weight just because it contributed more subgraphs.
         self.subgraphs_per_sample = subgraphs_per_sample
+        # {strategy_name: {"proportion": w, **strategy_kwargs}} -- which
+        # sampling strategy (or mix of strategies) each subgraph draw uses;
+        # None (default) means every draw uses plain BFS, exactly as
+        # before. See build_subproblem_batch's own docstring and
+        # create_subproblem.SAMPLING_STRATEGIES for the available
+        # strategies and their tunable parameters.
+        self.sampling_strategies = sampling_strategies
         self.voltage_weight = voltage_weight
         self.injection_weight = injection_weight
         self.edge_weight = edge_weight
@@ -304,7 +375,14 @@ class SubproblemConsistencyLoss:
             "SubgraphFinetuneTrainer.modify_loss)."
         )
 
-        sub_data, bus_map, voltage_mask, edge_map, va_offset = build_subproblem_batch(
+        (
+            sub_data,
+            bus_map,
+            voltage_mask,
+            edge_map,
+            va_offset,
+            strategy_per_subgraph,
+        ) = build_subproblem_batch(
             data,
             outputs,
             min_size=self.min_size,
@@ -313,6 +391,7 @@ class SubproblemConsistencyLoss:
             generator=self.generator,
             adjacency_cache=self._adjacency_cache,
             subgraphs_per_sample=self.subgraphs_per_sample,
+            sampling_strategies=self.sampling_strategies,
             stats=self.timings,
         )
         with _timed(self.timings, "second_forward"):
@@ -349,7 +428,14 @@ class SubproblemConsistencyLoss:
             teacher_bus = torch.stack([teacher_va, teacher_bus[:, 1]], dim=-1)
             if self.detach_teacher:
                 teacher_bus = teacher_bus.detach()
-            self.voltage_loss = _per_subgraph_mse(student_bus, teacher_bus, bus_batch[voltage_mask])
+            voltage_batch = bus_batch[voltage_mask]
+            if strategy_per_subgraph is None:
+                self.voltage_loss = _per_subgraph_mse(student_bus, teacher_bus, voltage_batch)
+                self.per_strategy_voltage_loss = {}
+            else:
+                self.voltage_loss, self.per_strategy_voltage_loss = _per_subgraph_mse(
+                    student_bus, teacher_bus, voltage_batch, strategy_per_subgraph
+                )
 
             # Net bus injections (P, Q). A genuine prediction on either side
             # whenever that bus is PV/slack there; a harmless (~0) echoed-input
@@ -364,7 +450,13 @@ class SubproblemConsistencyLoss:
             student_net = torch.stack([Pnet_s, Qnet_s], dim=-1)
             if self.detach_teacher:
                 teacher_net = teacher_net.detach()
-            self.injection_loss = _per_subgraph_mse(student_net, teacher_net, bus_batch)
+            if strategy_per_subgraph is None:
+                self.injection_loss = _per_subgraph_mse(student_net, teacher_net, bus_batch)
+                self.per_strategy_injection_loss = {}
+            else:
+                self.injection_loss, self.per_strategy_injection_loss = _per_subgraph_mse(
+                    student_net, teacher_net, bus_batch, strategy_per_subgraph
+                )
 
             # Interior branch flows (lines kept on both sides of the cut).
             # Edges don't get their own `.batch` from Batch.from_data_list --
@@ -376,7 +468,31 @@ class SubproblemConsistencyLoss:
             if self.detach_teacher:
                 teacher_edges = teacher_edges.detach()
             edge_src = sub_data["bus", "branch", "bus"].edge_index[0]
-            self.edge_loss = _per_subgraph_mse(student_edges, teacher_edges, bus_batch[edge_src])
+            edge_batch = bus_batch[edge_src]
+            if strategy_per_subgraph is None:
+                self.edge_loss = _per_subgraph_mse(student_edges, teacher_edges, edge_batch)
+                self.per_strategy_edge_loss = {}
+            else:
+                self.edge_loss, self.per_strategy_edge_loss = _per_subgraph_mse(
+                    student_edges, teacher_edges, edge_batch, strategy_per_subgraph
+                )
+
+            # Subgraph-PBL's own per-strategy breakdown -- self._pbl's full
+            # __call__ above already computed/stored .delta_P/.delta_Q (the
+            # same per-bus complex mismatch its own power_balance_mean is
+            # built from); reproduce its magnitude+pooling here rather than
+            # touching PowerBalanceLoss itself, which is also used
+            # elsewhere (the full-grid universal_power_balance loss) where
+            # "per sampling strategy" doesn't apply.
+            self.per_strategy_pbl_loss = {}
+            if strategy_per_subgraph is not None:
+                delta_pq_magn = torch.sqrt(
+                    self._pbl.delta_P**2 + self._pbl.delta_Q**2 + 1e-12
+                )
+                pbl_per_subgraph = global_mean_pool(delta_pq_magn, bus_batch)
+                self.per_strategy_pbl_loss = _group_by_strategy(
+                    pbl_per_subgraph, bus_batch.unique(), strategy_per_subgraph
+                )
 
             self.loss = (
                 self.voltage_weight * self.voltage_loss
@@ -384,6 +500,30 @@ class SubproblemConsistencyLoss:
                 + self.edge_weight * self.edge_loss
                 + self.pbl_weight * self.pbl_loss
             )
+
+            # Same weighted combination as self.loss above, but per
+            # strategy -- for logging only (see RecycleLoss's dotted-path
+            # support), computed over whichever strategies appear in ANY
+            # of the four per-strategy breakdowns (a strategy missing from
+            # one -- e.g. no draws contributed a voltage_loss row but some
+            # did contribute an injection_loss row -- just contributes 0
+            # for that missing term rather than being dropped entirely).
+            self.per_strategy_loss = {}
+            if strategy_per_subgraph is not None:
+                strategy_names = (
+                    set(self.per_strategy_voltage_loss)
+                    | set(self.per_strategy_injection_loss)
+                    | set(self.per_strategy_edge_loss)
+                    | set(self.per_strategy_pbl_loss)
+                )
+                zero = torch.zeros((), device=self.loss.device)
+                for name in strategy_names:
+                    self.per_strategy_loss[name] = (
+                        self.voltage_weight * self.per_strategy_voltage_loss.get(name, zero)
+                        + self.injection_weight * self.per_strategy_injection_loss.get(name, zero)
+                        + self.edge_weight * self.per_strategy_edge_loss.get(name, zero)
+                        + self.pbl_weight * self.per_strategy_pbl_loss.get(name, zero)
+                    )
         return self.loss
 
 

@@ -1,0 +1,64 @@
+# Consistency transfer test: evaluate an ALREADY-TRAINED, FROZEN model's
+# self-consistency (SubproblemConsistencyLoss) across every combination of
+# (source case, subgraph size band) below -- no further training, no
+# gradient steps, no optimizer/scheduler/checkpoint machinery at all (see
+# scripts/evaluate_consistency_transfer.py, which reads this directly --
+# NOT a simple_batch/SLURM sweep config like the training ones).
+#
+# Answers: is self-consistency a property of the specific (case, size) a
+# model was trained/tuned on, or something more fundamental about the
+# model itself? E.g. does a model that's highly self-consistent on case500
+# cut to 3-7-bus subgraphs stay just as consistent on case118 cut to
+# 24-36-bus subgraphs? The model is structurally case-agnostic (dataset is
+# only used at construction time to infer feature dimensions and stamp a
+# cosmetic "casename" into outputs -- see CANOS_PF.__init__ -- never used
+# for computation; per-case normalization happens entirely at the dataset
+# level before data reaches the model), so evaluating a case500-trained
+# model on case118 data is exactly the same code path as case500 data.
+
+# Path to the TRAINING run to evaluate -- reads hidden_dim/k_steps/
+# include_sent_messages from its own config.yaml (so you never have to
+# duplicate the architecture here) and loads weights from its model.pt.
+source_run: runs/canos_task_3_1_joint_train/<run_name_here>
+
+# Shared across every case tested -- matching how the source run's own
+# dataset entries were configured (see its config.yaml's dataset.datasets).
+root_dir: /orcd/pool/005/donti_shared/pfdelta_data
+task: 1.3
+dataset_name: pfdeltaCANOS
+model_dataset_name: CANOS
+add_bus_type: true
+split: val  # which split of EACH case below to evaluate on
+
+# Every case here gets tested against every size band below -- a full
+# cross product, cases x size_bands combinations, each reported as its own
+# matrix cell.
+cases:
+  - case14
+  - case30
+  - case57
+  - case118
+  - case500
+
+size_bands:
+  - name: tiny
+    min_size: 3
+    max_size: 7
+  - name: medium
+    min_size: 10
+    max_size: 20
+  - name: large
+    min_size: 24
+    max_size: 36
+
+batch_size: 64
+subgraphs_per_sample: 4
+seed: 11
+detach_teacher: true
+# Optional -- same sampling_strategies schema as a training config's
+# subproblem_consistency entry (see core.utils.create_subproblem.
+# SAMPLING_STRATEGIES). Omit (or leave null) for plain BFS.
+sampling_strategies: null
+
+# "cuda" if available, else "cpu" -- override if you want to force one.
+device: null

@@ -1,5 +1,5 @@
 """
-Two purpose-built plots for a subgraph_finetune_trainer run (canos_task_3_1_
+Purpose-built plots for a subgraph_finetune_trainer run (canos_task_3_1_
 finetune.yaml / canos_task_3_1_joint_train.yaml style configs):
 
 1. Training objective: train_loss[0]'s own value (already the correctly-
@@ -18,6 +18,16 @@ finetune.yaml / canos_task_3_1_joint_train.yaml style configs):
 2. Universal power balance (PBL Mean) on every validation set separately,
    including case500 -- the actual metric that matters, independent of
    which augmentation weights were used to get there.
+
+3. Consistency loss broken down by sampling strategy (bfs/random_walk/
+   forest_fire/snowball -- see core.utils.create_subproblem.
+   SAMPLING_STRATEGIES), train and case500-val, if the run's config
+   actually used `sampling_strategies` (see SubproblemConsistencyLoss.
+   per_strategy_loss) -- reads the "Consistency [<name>]" keys the config
+   wires up via RecycleLoss's dotted recycled_parameter support. Skipped
+   gracefully (with a printed note, not an error) for a run that didn't
+   configure sampling_strategies, so this script still works on any
+   subgraph_finetune_trainer run either way.
 """
 import os
 import glob
@@ -111,6 +121,25 @@ def get_consistency_weights(config):
     return w2, w3, subgraph_pbl_val_key
 
 
+def get_sampling_strategy_names(config):
+    """Reads which sampling strategies (if any) train_loss[0]'s
+    subproblem_consistency entry was configured with (see
+    core.utils.create_subproblem.SAMPLING_STRATEGIES /
+    custom_losses.SubproblemConsistencyLoss.sampling_strategies). Returns
+    [] for a run that didn't use sampling_strategies (plain BFS only), in
+    which case plot_per_strategy_consistency has nothing to plot."""
+    train_loss0 = config["optim"]["train_params"]["train_loss"][0]
+    losses = train_loss0["losses"]
+    consistency_entry = _find_loss_entry(losses, name="subproblem_consistency")
+    if consistency_entry is None:
+        return []
+    inputs = consistency_entry.get("inputs", consistency_entry)
+    strategies = inputs.get("sampling_strategies")
+    if not strategies:
+        return []
+    return list(strategies.keys())
+
+
 def _sorted_epochs(data):
     return sorted(data.keys(), key=int)
 
@@ -187,19 +216,83 @@ def plot_universal_pbl(run_name, config, val_data, out_path, log=False):
     print(f"Saved {out_path}")
 
 
+def plot_per_strategy_consistency(run_name, config, train_data, val_data, out_path, log=False):
+    """Consistency loss (the same weighted 1.0*voltage + 1.0*injection +
+    1.0*edge + pbl_weight*pbl combination as train_loss[0]'s own
+    "Consistency subtotal", just broken out per sampling strategy -- see
+    SubproblemConsistencyLoss.per_strategy_loss), one line per configured
+    strategy, train (solid) and case500-val (dashed). Returns the list of
+    strategy names actually plotted, or None if this run didn't configure
+    sampling_strategies / doesn't have the corresponding train.json keys
+    (an older run, or a config that didn't wire the per-strategy
+    recycle_loss entries) -- in either case this is a no-op, not an error,
+    so callers can just skip it (and any downstream file it would have
+    produced) when it returns None.
+    """
+    strategy_names = get_sampling_strategy_names(config)
+    if not strategy_names:
+        print("No sampling_strategies configured for this run -- skipping per-strategy consistency plot.")
+        return None
+
+    train_epochs = _sorted_epochs(train_data)
+    val_epochs = _sorted_epochs(val_data)
+    case500_idx = get_case500_val_index(config)
+
+    first_epoch_keys = train_data[train_epochs[0]].keys()
+    available = [name for name in strategy_names if f"Consistency [{name}]" in first_epoch_keys]
+    missing = [name for name in strategy_names if name not in available]
+    if missing:
+        print(
+            f"Note: no 'Consistency [<name>]' key in train.json for: {missing} "
+            "(older run, or config didn't wire per-strategy recycle_loss entries for it)"
+        )
+    if not available:
+        print("None of the configured strategies have a matching train.json key -- skipping per-strategy consistency plot.")
+        return None
+
+    plt.figure(figsize=(10, 6))
+    colors = plt.cm.tab10.colors
+    for i, name in enumerate(available):
+        key = f"Consistency [{name}]"
+        color = colors[i % len(colors)]
+        train_vals = [train_data[e].get(key) for e in train_epochs]
+        plt.plot(
+            list(map(int, train_epochs)), train_vals,
+            marker="o", linestyle="-", color=color, label=f"{name} (train)",
+        )
+        if all(key in val_data[e][case500_idx] for e in val_epochs):
+            val_vals = [val_data[e][case500_idx].get(key) for e in val_epochs]
+            plt.plot(
+                list(map(int, val_epochs)), val_vals,
+                marker="s", linestyle="--", color=color, alpha=0.7,
+                label=f"{name} (val, case500)",
+            )
+    plt.xlabel("Training point")
+    plt.ylabel("Consistency loss (weighted, per sampling strategy)")
+    plt.title(f"{run_name} - consistency loss by sampling strategy")
+    if log:
+        plt.yscale("log")
+    plt.legend()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    print(f"Saved {out_path}")
+    return available
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "Plot (1) the actual weighted training objective vs. the same "
             "combination reconstructed on the case500 (same-distribution) "
-            "val set, and (2) universal PBL on every validation set "
-            "separately, for a subgraph_finetune_trainer run."
+            "val set, (2) universal PBL on every validation set "
+            "separately, and (3) consistency loss broken down by sampling "
+            "strategy (if the run configured sampling_strategies), for a "
+            "subgraph_finetune_trainer run."
         )
     )
     parser.add_argument("--run_name", type=str, required=True)
     parser.add_argument(
         "--log", action="store_true", default=False,
-        help="Log-scale the y-axis on both plots.",
+        help="Log-scale the y-axis on every plot produced.",
     )
     args = parser.parse_args()
     print(f"Searching for folder with name {args.run_name}")
@@ -211,13 +304,19 @@ if __name__ == "__main__":
 
     objective_path = f"{run_path}/plot_training_objective.png"
     pbl_path = f"{run_path}/plot_universal_pbl.png"
+    per_strategy_path = f"{run_path}/plot_per_strategy_consistency.png"
 
     train_key, w2, w3, subgraph_pbl_key = plot_training_objective(
         args.run_name, config, train_data, val_data, objective_path, log=args.log
     )
     plot_universal_pbl(args.run_name, config, val_data, pbl_path, log=args.log)
+    plotted_strategies = plot_per_strategy_consistency(
+        args.run_name, config, train_data, val_data, per_strategy_path, log=args.log
+    )
 
     print()
     print(f"Training objective key (train.json): {train_key!r}")
     print(f"Reconstruction weights: w2 (consistency) = {w2}, w3 (subgraph-PBL) = {w3}")
     print(f"Subgraph-PBL val.json key: {subgraph_pbl_key!r}")
+    if plotted_strategies:
+        print(f"Sampling strategies plotted: {plotted_strategies}")

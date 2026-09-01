@@ -124,8 +124,10 @@ def update_base_topology_cache(
     in EVERY sample of EVERY batch seen so far to still be missing.
 
     Populates/refreshes `base_cache["base_keys"]` (sorted unique canonical
-    edge keys, LOCAL) and `base_cache["base_adjacency"]` (list[list[int]],
-    size num_nodes_per_case, LOCAL indices) in place.
+    edge keys, LOCAL), `base_cache["base_adjacency"]` (list[list[int]],
+    size num_nodes_per_case, LOCAL indices), and `base_cache["degrees"]`
+    (list[int], per-node degree over that same base adjacency -- used by
+    `sample_bus_subset_snowball`) in place.
 
     Returns
     -------
@@ -162,6 +164,12 @@ def update_base_topology_cache(
             adjacency[j].append(i)
         base_cache["base_adjacency"] = adjacency
         base_cache["num_nodes_per_case"] = num_nodes_per_case
+        # Per-node degree over the base topology -- only used by
+        # sample_bus_subset_snowball's degree-inverse weighting, but cheap
+        # to keep in sync here (recomputed only when the base topology
+        # itself changes, same trigger as the adjacency list above) rather
+        # than recomputed by every snowball draw.
+        base_cache["degrees"] = [len(neighbors) for neighbors in adjacency]
     return changed
 
 
@@ -328,6 +336,299 @@ def sample_bus_subset(
         frontier = next_frontier
 
     return torch.tensor(sorted(kept), dtype=torch.long)
+
+
+def _weighted_shuffle(items: list, weights: list, rng: pyrandom.Random) -> list:
+    """
+    Weighted random permutation without replacement (Efraimidis-Spirakis
+    A-Res algorithm): draw `key = u ** (1/weight)` for `u ~ Uniform(0, 1)`
+    per item, then sort by key descending. A higher-weight item is more
+    likely to land earlier, but nothing is excluded -- every item still
+    appears exactly once, same contract as `rng.shuffle`. Reduces to a
+    plain uniform shuffle when every weight is equal.
+    """
+    keyed = [
+        (rng.random() ** (1.0 / w) if w > 0 else 0.0, item)
+        for item, w in zip(items, weights)
+    ]
+    keyed.sort(key=lambda kv: kv[0], reverse=True)
+    return [item for _, item in keyed]
+
+
+def sample_bus_subset_random_walk(
+    adjacency: list,
+    seed_bus: int,
+    min_size,
+    max_size,
+    generator: Optional[torch.Generator] = None,
+    bus_offset: int = 0,
+    excluded_neighbors: Optional[dict] = None,
+    restart_prob: float = 0.15,
+    max_steps_factor: int = 50,
+) -> torch.Tensor:
+    """
+    Random walk with restart (RWR): from `current` (starting at `seed_bus`),
+    each step either jumps back to `seed_bus` (probability `restart_prob`)
+    or moves to one random neighbor of `current`; every node visited this
+    way is added to the growing subset. Stops once the target size (sampled
+    uniformly from [min_size, max_size], same as `sample_bus_subset`) is
+    hit, or after `max_steps_factor * target_size` steps (bounded, so a
+    small/sparse region can't spin forever) -- returns a smaller subset
+    than requested in that case, same "stops early rather than failing"
+    contract as `sample_bus_subset`.
+
+    The walk's own trace is always connected back to `seed_bus` (every
+    node is reached by an actual edge traversal from somewhere already in
+    the trace), same connectivity guarantee as BFS -- just a different
+    (locally-biased, revisits allowed) exploration shape: lower
+    `restart_prob` lets the walk wander further from `seed_bus` before
+    reseeding, higher `restart_prob` keeps it concentrated nearby.
+
+    Parameters mirror `sample_bus_subset` (`adjacency`/`bus_offset`/
+    `excluded_neighbors`), plus:
+
+    restart_prob : float
+        Probability of jumping back to `seed_bus` at each step, instead of
+        moving to a neighbor of the current node.
+    max_steps_factor : int
+        Step budget, as a multiple of the target size.
+    """
+    lo, hi = int(min_size), int(max_size)
+    lo, hi = min(lo, hi), max(lo, hi)
+    target_size = torch.randint(lo, hi + 1, (1,), generator=generator).item()
+    local_seed = torch.randint(0, 2**31 - 1, (1,), generator=generator).item()
+    rng = pyrandom.Random(local_seed)
+
+    visited = {seed_bus}
+    kept = [seed_bus]
+    current = seed_bus
+    max_steps = max(target_size * max_steps_factor, 100)
+
+    for _ in range(max_steps):
+        if len(kept) >= target_size:
+            break
+        if rng.random() < restart_prob:
+            current = seed_bus
+            continue
+        current_local = current - bus_offset
+        neighbors_local = adjacency[current_local]
+        if not neighbors_local:
+            current = seed_bus  # dead end (isolated node) -- reseed
+            continue
+        excluded = excluded_neighbors.get(current_local) if excluded_neighbors else None
+        # One random neighbor, respecting exclusions. Retries (bounded by
+        # this node's own degree) rather than filtering the whole list up
+        # front -- cheap since exclusions are typically 0-2 entries (an
+        # N-1/N-2 contingency), so this converges on the first try almost
+        # always.
+        neighbor_local = None
+        for _ in range(len(neighbors_local)):
+            candidate = rng.choice(neighbors_local)
+            if excluded is not None and candidate in excluded:
+                continue
+            neighbor_local = candidate
+            break
+        if neighbor_local is None:
+            current = seed_bus  # every neighbor excluded -- reseed
+            continue
+        current = neighbor_local + bus_offset
+        if current not in visited:
+            visited.add(current)
+            kept.append(current)
+
+    return torch.tensor(sorted(kept), dtype=torch.long)
+
+
+def sample_bus_subset_forest_fire(
+    adjacency: list,
+    seed_bus: int,
+    min_size,
+    max_size,
+    generator: Optional[torch.Generator] = None,
+    bus_offset: int = 0,
+    excluded_neighbors: Optional[dict] = None,
+    p: float = 0.3,
+) -> torch.Tensor:
+    """
+    Forest Fire sampling (Leskovec et al.): grows shell-by-shell like BFS,
+    but at each "burning" node only a RANDOM SUBSET of its unvisited
+    neighbors catches fire, rather than all of them -- the "forward-
+    burning" count is drawn from a Geometric(1-p) distribution (repeatedly
+    include one more candidate with probability `p`, stop with probability
+    `1-p`), applied to a randomly-ordered candidate list, so which specific
+    neighbors get chosen is also random. Same connectivity guarantee as
+    BFS (grown via real edge traversals from `seed_bus`), but a
+    structurally different, more "bursty"/tree-like shape controlled by
+    `p`: near 1, behaves close to full BFS (almost everything catches
+    fire); near 0, fires tend to die out quickly.
+
+    Unlike `sample_bus_subset`/the random walk above, a fire dying out
+    (every burning node's draw comes up empty) is expected, authentic
+    forest-fire behavior, not just a size-budget shortfall -- for a low
+    `p` this can return a subset well short of `max_size` even in a large,
+    densely-connected region, which is the actual structural property this
+    sampling model is meant to exhibit.
+
+    Parameters mirror `sample_bus_subset`, plus:
+
+    p : float
+        Forward-burning probability -- higher spreads wider/faster.
+    """
+    lo, hi = int(min_size), int(max_size)
+    lo, hi = min(lo, hi), max(lo, hi)
+    target_size = torch.randint(lo, hi + 1, (1,), generator=generator).item()
+    local_seed = torch.randint(0, 2**31 - 1, (1,), generator=generator).item()
+    rng = pyrandom.Random(local_seed)
+
+    visited = {seed_bus}
+    kept = [seed_bus]
+    frontier = [seed_bus]
+    while frontier and len(kept) < target_size:
+        next_frontier = []
+        for node in frontier:
+            if len(kept) >= target_size:
+                break
+            node_local = node - bus_offset
+            neighbors_local = adjacency[node_local]
+            excluded = excluded_neighbors.get(node_local) if excluded_neighbors else None
+            candidates = [
+                n for n in neighbors_local
+                if (n + bus_offset) not in visited
+                and (excluded is None or n not in excluded)
+            ]
+            if not candidates:
+                continue
+            rng.shuffle(candidates)
+            burn_count = 0
+            while burn_count < len(candidates) and rng.random() < p:
+                burn_count += 1
+            for neighbor_local in candidates[:burn_count]:
+                neighbor = neighbor_local + bus_offset
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                kept.append(neighbor)
+                next_frontier.append(neighbor)
+                if len(kept) >= target_size:
+                    break
+        frontier = next_frontier
+
+    return torch.tensor(sorted(kept), dtype=torch.long)
+
+
+def sample_bus_subset_snowball(
+    adjacency: list,
+    seed_bus: int,
+    min_size,
+    max_size,
+    generator: Optional[torch.Generator] = None,
+    bus_offset: int = 0,
+    excluded_neighbors: Optional[dict] = None,
+    degrees: Optional[list] = None,
+    degree_weight_power: float = 1.0,
+) -> torch.Tensor:
+    """
+    Snowball sampling with degree-inverse weighting: identical BFS growth
+    structure to `sample_bus_subset` (same shells, same stopping rule, same
+    connectivity guarantee), but each shell's neighbor visitation order is
+    a WEIGHTED random permutation (weight ∝ 1/degree(neighbor)^
+    degree_weight_power -- see `_weighted_shuffle`) instead of a uniform
+    one, so lower-degree ("peripheral") buses are more likely to be
+    included before the target size is hit than high-degree hub buses are.
+    `degree_weight_power=0` reduces exactly to plain BFS's uniform shuffle
+    (every weight becomes 1); larger values bias more strongly toward
+    low-degree buses.
+
+    Parameters mirror `sample_bus_subset`, plus:
+
+    degrees : list[int], optional
+        Per-(case-local)-node degree, e.g. `[len(n) for n in adjacency]` --
+        cached alongside `adjacency` itself (see `update_base_topology_
+        cache`) since it depends only on the (rarely-changing) base
+        topology, not on any one sample's own contingency. Required
+        whenever `degree_weight_power != 0`; with it 0, weighting is
+        skipped entirely and this parameter is unused.
+    degree_weight_power : float
+        Exponent on the inverse-degree weight.
+    """
+    lo, hi = int(min_size), int(max_size)
+    lo, hi = min(lo, hi), max(lo, hi)
+    target_size = torch.randint(lo, hi + 1, (1,), generator=generator).item()
+    local_seed = torch.randint(0, 2**31 - 1, (1,), generator=generator).item()
+    rng = pyrandom.Random(local_seed)
+
+    visited = {seed_bus}
+    kept = [seed_bus]
+    frontier = [seed_bus]
+    use_weights = degree_weight_power != 0 and degrees is not None
+    while frontier and len(kept) < target_size:
+        next_frontier = []
+        for node in frontier:
+            node_local = node - bus_offset
+            neighbors_local = adjacency[node_local]
+            excluded = excluded_neighbors.get(node_local) if excluded_neighbors else None
+            candidates = [
+                n for n in neighbors_local
+                if excluded is None or n not in excluded
+            ]
+            if not candidates:
+                continue
+            if use_weights:
+                weights = [1.0 / max(degrees[n], 1) ** degree_weight_power for n in candidates]
+                ordered = _weighted_shuffle(candidates, weights, rng)
+            else:
+                ordered = candidates[:]
+                rng.shuffle(ordered)
+            for neighbor_local in ordered:
+                neighbor = neighbor_local + bus_offset
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                kept.append(neighbor)
+                next_frontier.append(neighbor)
+                if len(kept) >= target_size:
+                    break
+            if len(kept) >= target_size:
+                break
+        frontier = next_frontier
+
+    return torch.tensor(sorted(kept), dtype=torch.long)
+
+
+# Registry of sampling strategies, keyed by the name used in a
+# `sampling_strategies` config dict (see `build_subproblem_batch`). Every
+# entry has the same core call signature (adjacency, seed_bus, min_size,
+# max_size, generator=, bus_offset=, excluded_neighbors=), plus whatever
+# strategy-specific tunable kwargs its own config entry supplies.
+SAMPLING_STRATEGIES = {
+    "bfs": sample_bus_subset,
+    "random_walk": sample_bus_subset_random_walk,
+    "forest_fire": sample_bus_subset_forest_fire,
+    "snowball": sample_bus_subset_snowball,
+}
+
+
+def pick_sampling_strategy(sampling_strategies: dict, generator: Optional[torch.Generator] = None) -> str:
+    """
+    Weighted random choice of one strategy name from a `sampling_strategies`
+    config dict (`{name: {"proportion": w, ...other kwargs}}`) -- weights
+    need not sum to 1, they're normalized here. Uses the shared
+    `torch.Generator` directly (one `torch.rand` draw), the same RNG this
+    whole pipeline's other per-call choices (target size, local traversal
+    seed) already come from, rather than spinning up a separate local RNG
+    just for this one draw.
+    """
+    names = list(sampling_strategies.keys())
+    weights = [float(sampling_strategies[n].get("proportion", 1.0)) for n in names]
+    total = sum(weights)
+    assert total > 0, "sampling_strategies proportions must sum to something positive"
+    r = torch.rand(1, generator=generator).item() * total
+    cum = 0.0
+    for name, w in zip(names, weights):
+        cum += w
+        if r <= cum:
+            return name
+    return names[-1]  # floating-point safety net for r landing exactly on `total`
 
 
 def _remap_node_type(data, sub_data, node_type, link_name, keep_mask, new_index):
@@ -888,6 +1189,7 @@ def build_subproblem_batch(
     generator: Optional[torch.Generator] = None,
     adjacency_cache: Optional[dict] = None,
     subgraphs_per_sample: int = 1,
+    sampling_strategies: Optional[dict] = None,
     stats: Optional[dict] = None,
 ) -> tuple:
     """
@@ -948,10 +1250,26 @@ def build_subproblem_batch(
     subgraphs_per_sample : int, optional
         How many independent subgraphs to draw per original sample in
         `data` (default 1, matching the original single-subgraph-per-
-        sample behavior). Each is its own independent BFS draw (own seed
-        bus, own size sampled from [min_size, max_size]) -- memory/compute
-        for the resulting `sub_data` batch scales with the total node/edge
-        count across all of them, same as increasing batch_size would.
+        sample behavior). Each is its own independent draw (own seed bus,
+        own size sampled from [min_size, max_size], own sampling strategy
+        if `sampling_strategies` is given) -- memory/compute for the
+        resulting `sub_data` batch scales with the total node/edge count
+        across all of them, same as increasing batch_size would.
+    sampling_strategies : dict, optional
+        `{strategy_name: {"proportion": w, **strategy_kwargs}}` -- e.g.
+        `{"bfs": {"proportion": 0.5}, "random_walk": {"proportion": 0.5,
+        "restart_prob": 0.2}}`. Each of the (subgraphs_per_sample *
+        num_samples) draws independently picks one strategy at random,
+        weighted by `proportion` (need not sum to 1 -- normalized; see
+        `pick_sampling_strategy`), and calls it with `strategy_kwargs` on
+        top of the shared min_size/max_size/generator/bus_offset/
+        excluded_neighbors arguments every strategy in `SAMPLING_
+        STRATEGIES` accepts. Draws are independent per call, not fixed per
+        batch -- see this function's own module-level discussion of why
+        that costs nothing extra (none of these strategies are vectorized
+        across simultaneous draws to begin with). Defaults to None, i.e.
+        always `sample_bus_subset` (plain BFS) -- the original, single-
+        strategy behavior, with zero added dispatch overhead.
     stats : dict, optional
         Opt-in profiling: if given, accumulates wall-clock seconds (summed
         across repeated calls) under keys "adjacency", "sample_bus_subset",
@@ -963,6 +1281,13 @@ def build_subproblem_batch(
     sub_data : Batch
     bus_map, voltage_mask, edge_map, va_offset : torch.Tensor
         Concatenated across the batch; see `build_subproblem`.
+    strategy_per_subgraph : list[str] or None
+        Which entry of `sampling_strategies` produced each subgraph, in the
+        same order as `sub_data`'s own subgraphs (i.e. index i here is
+        subgraph i's own `sub_data["bus"].batch` id) -- for per-strategy
+        error reporting (see `custom_losses.SubproblemConsistencyLoss`).
+        None when `sampling_strategies` itself is None (nothing to break
+        down by).
     """
     bus_store = data["bus"]
     device = bus_store.x.device
@@ -1007,7 +1332,18 @@ def build_subproblem_batch(
     # here -- see _build_subproblem_vectorized's docstring.
     with _timed(stats, "sample_bus_subset"):
         ptr_list = ptr.tolist()
+        # Only needed for strategy="snowball" -- cached alongside the base
+        # adjacency when available; computed once here (not per-draw) in
+        # the fallback path, where there's no persistent cache to hang it
+        # off of.
+        degrees = None
+        if sampling_strategies is not None:
+            degrees = (
+                adjacency_cache.get("degrees") if use_base_mode
+                else [len(n) for n in adjacency]
+            )
         bus_subset_list = []
+        strategy_per_subgraph = [] if sampling_strategies is not None else None
         for k in range(len(ptr_list) - 1):
             lo, hi = ptr_list[k], ptr_list[k + 1]
             if hi <= lo:
@@ -1026,18 +1362,35 @@ def build_subproblem_batch(
             else:
                 sample_kwargs = dict(adjacency=adjacency)
             # subgraphs_per_sample independent draws per original sample --
-            # own seed bus and own BFS growth each time, so within one
-            # sample the draws aren't just copies of each other (nothing
-            # here shares state between draws besides the RNG stream).
+            # own seed bus, own sampling strategy (if sampling_strategies
+            # is given -- see this function's own docstring for why mixing
+            # per-draw, rather than pinning one strategy per batch, doesn't
+            # cost anything extra here), and own growth each time, so
+            # within one sample the draws aren't just copies of each other.
             for _ in range(subgraphs_per_sample):
                 seed_bus = torch.randint(lo, hi, (1,), generator=generator).item()
+                if sampling_strategies is not None:
+                    strategy_name = pick_sampling_strategy(sampling_strategies, generator=generator)
+                    strategy_fn = SAMPLING_STRATEGIES[strategy_name]
+                    strategy_kwargs = {
+                        key: value
+                        for key, value in sampling_strategies[strategy_name].items()
+                        if key != "proportion"
+                    }
+                    if strategy_name == "snowball":
+                        strategy_kwargs.setdefault("degrees", degrees)
+                    strategy_per_subgraph.append(strategy_name)
+                else:
+                    strategy_fn = sample_bus_subset
+                    strategy_kwargs = {}
                 bus_subset_list.append(
-                    sample_bus_subset(
+                    strategy_fn(
                         seed_bus=seed_bus,
                         min_size=min_size,
                         max_size=max_size,
                         generator=generator,
                         **sample_kwargs,
+                        **strategy_kwargs,
                     )
                 )
 
@@ -1059,4 +1412,11 @@ def build_subproblem_batch(
             detach_teacher=detach_teacher,
         )
 
-    return sub_data_batch, bus_map_all, voltage_mask_all, edge_map_all, va_offset_all
+    return (
+        sub_data_batch,
+        bus_map_all,
+        voltage_mask_all,
+        edge_map_all,
+        va_offset_all,
+        strategy_per_subgraph,
+    )
