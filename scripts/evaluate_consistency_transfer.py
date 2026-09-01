@@ -48,13 +48,57 @@ def build_dataset(dataset_name, root_dir, case_name, split, model_dataset_name, 
     )
 
 
-def build_model(source_config: dict, reference_dataset, device):
-    """Builds the model with the SOURCE run's own architecture (hidden_dim/
-    k_steps/include_sent_messages, read from its config.yaml -- never
-    duplicated here) -- `reference_dataset` is only used to infer feature
-    dimensions at construction time (see this script's own module
+def resolve_architecture(cfg: dict) -> dict:
+    """Model architecture kwargs (name/hidden_dim/k_steps/
+    include_sent_messages) -- taken directly from the eval config wherever
+    given there (a `model:` block, same shape as a training config's own),
+    falling back to source_run's own config.yaml ONLY for whichever keys
+    are missing. Explicit values here always win, and if all four are
+    given directly, source_run's config.yaml is never read at all -- so
+    you don't need a source_run/config.yaml to exist if you'd rather just
+    specify k_steps/hidden_dim/etc. yourself (e.g. pointing straight at a
+    bare model_path)."""
+    explicit = dict(cfg.get("model", {}))
+    required = {"name", "hidden_dim", "k_steps", "include_sent_messages"}
+    missing = required - explicit.keys()
+    if missing:
+        assert cfg.get("source_run"), (
+            f"model: is missing {sorted(missing)} and no source_run was given to read "
+            "them from -- either add a source_run (a directory with its own "
+            "config.yaml), or specify all of name/hidden_dim/k_steps/"
+            "include_sent_messages directly under model: in this eval config."
+        )
+        source_model_cfg = load_source_config(cfg["source_run"])["model"]
+        for key in missing:
+            assert key in source_model_cfg, (
+                f"{key!r} not found in {cfg['source_run']}/config.yaml's own model: "
+                f"block either -- specify it explicitly under this eval config's model: instead."
+            )
+            explicit[key] = source_model_cfg[key]
+    return explicit
+
+
+def resolve_model_path(cfg: dict) -> str:
+    if cfg.get("model_path"):
+        return cfg["model_path"]
+    assert cfg.get("source_run"), "Need either model_path or source_run to know where to load weights from."
+    return os.path.join(cfg["source_run"], "model.pt")
+
+
+def resolve_output_dir(cfg: dict) -> str:
+    if cfg.get("output_dir"):
+        return cfg["output_dir"]
+    assert cfg.get("source_run"), "Need either output_dir or source_run to know where to save results."
+    return cfg["source_run"]
+
+
+def build_model(architecture: dict, reference_dataset, device):
+    """`architecture` is what resolve_architecture returned -- a plain
+    dict of model constructor kwargs (name/hidden_dim/k_steps/
+    include_sent_messages). `reference_dataset` is only used to infer
+    feature dimensions at construction time (see this script's own module
     docstring for why any case's dataset works equally well for this)."""
-    model_cfg = copy.deepcopy(source_config["model"])
+    model_cfg = copy.deepcopy(architecture)
     model_name = model_cfg.pop("name")
     model_cfg["dataset"] = reference_dataset
     model_class = registry.get_model_class(model_name)
@@ -62,8 +106,8 @@ def build_model(source_config: dict, reference_dataset, device):
     return model_class(**model_cfg).to(device)
 
 
-def load_weights(model, source_run: str):
-    state_dict = torch.load(os.path.join(source_run, "model.pt"), map_location="cpu")
+def load_weights(model, model_path: str):
+    state_dict = torch.load(model_path, map_location="cpu")
     model.load_state_dict(state_dict)
 
 
@@ -216,8 +260,10 @@ def main(config_path: str) -> dict:
     device = torch.device(
         cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    source_run = cfg["source_run"]
-    source_config = load_source_config(source_run)
+    architecture = resolve_architecture(cfg)
+    model_path = resolve_model_path(cfg)
+    output_dir = resolve_output_dir(cfg)
+    os.makedirs(output_dir, exist_ok=True)
 
     case_names = cfg["cases"]
     band_names = [b["name"] for b in cfg["size_bands"]]
@@ -227,9 +273,10 @@ def main(config_path: str) -> dict:
         cfg["dataset_name"], cfg["root_dir"], case_names[0], cfg["split"],
         cfg["model_dataset_name"], cfg["task"], cfg["add_bus_type"],
     )
-    model = build_model(source_config, reference_dataset, device)
-    load_weights(model, source_run)
-    print(f"Loaded model from {source_run}")
+    print(f"Architecture: {architecture}")
+    model = build_model(architecture, reference_dataset, device)
+    load_weights(model, model_path)
+    print(f"Loaded weights from {model_path}")
 
     dataset_cache = {case_names[0]: reference_dataset}
 
@@ -283,7 +330,7 @@ def main(config_path: str) -> dict:
     print("\nConsistency loss matrix (rows=case, columns=size band):")
     print_matrix(results, case_names, band_names, metric="loss")
 
-    out_json = os.path.join(source_run, "consistency_transfer_eval.json")
+    out_json = os.path.join(output_dir, "consistency_transfer_eval.json")
     json.dump(
         {f"{c}|{b}": v for (c, b), v in results.items()},
         open(out_json, "w"),
@@ -291,7 +338,7 @@ def main(config_path: str) -> dict:
     )
     print(f"\nSaved full results (all components, not just .loss) to {out_json}")
 
-    out_png = os.path.join(source_run, "consistency_transfer_eval.png")
+    out_png = os.path.join(output_dir, "consistency_transfer_eval.png")
     plot_heatmap(results, case_names, band_names, out_png, metric="loss")
 
     return results

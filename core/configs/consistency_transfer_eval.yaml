@@ -16,10 +16,39 @@
 # level before data reaches the model), so evaluating a case500-trained
 # model on case118 data is exactly the same code path as case500 data.
 
-# Path to the TRAINING run to evaluate -- reads hidden_dim/k_steps/
-# include_sent_messages from its own config.yaml (so you never have to
-# duplicate the architecture here) and loads weights from its model.pt.
+# Path to the training run's OWN DIRECTORY (not model.pt itself -- this
+# needs to find BOTH <source_run>/config.yaml and <source_run>/model.pt
+# inside it). Used three ways, each independently overridable below if you
+# don't want it doing double (or triple) duty:
+#   1. Default location to load weights from (<source_run>/model.pt) --
+#      override with model_path if you want to point at a bare .pt file
+#      that isn't sitting in a run directory at all.
+#   2. Default source for hidden_dim/k_steps/include_sent_messages/name,
+#      read from <source_run>/config.yaml's own model: block -- override
+#      by filling in model: below yourself; if you specify ALL FOUR
+#      there, source_run's config.yaml is never read for this at all, so
+#      you don't need it to exist (or even need source_run set) as long
+#      as model_path/output_dir are both given explicitly too.
+#   3. Default place to write consistency_transfer_eval.json/.png --
+#      override with output_dir.
 source_run: runs/canos_task_3_1_joint_train/<run_name_here>
+
+# Uncomment to bypass source_run's config.yaml for the architecture
+# entirely (e.g. if you only have a bare model_path, or its config.yaml
+# is missing/wrong) -- fill in whichever of these source_run's own
+# config.yaml shouldn't be trusted for; any left out still get read from
+# there as normal.
+# model:
+#   name: canos_pf
+#   hidden_dim: 256
+#   k_steps: 15
+#   include_sent_messages: true
+
+# Uncomment to load weights from somewhere other than <source_run>/model.pt.
+# model_path: runs/canos_task_3_1_joint_train/<run_name_here>/model.pt
+
+# Uncomment to save results somewhere other than source_run itself.
+# output_dir: runs/canos_task_3_1_joint_train/<run_name_here>
 
 # Shared across every case tested -- matching how the source run's own
 # dataset entries were configured (see its config.yaml's dataset.datasets).
