@@ -152,7 +152,7 @@ optim:
         w_sg_cons: _connected_list(consw -- 0.01, 0.1, 1 | 0.01, 0.1, 1)
         # mix: which sampling-strategy blend this job uses -- own "mix"
         # connect key, independent of consw/sgband/pblw, cross-producted
-        # with everything else (3x whatever the job count already was).
+        # with everything else (9x whatever the job count already was).
         # A SIBLING of weight/w_sg_cons here (not inside inputs:), so
         # CombinedLoss's own "only read name/weight/inputs, ignore
         # everything else" behavior drops it before it ever reaches
@@ -165,7 +165,7 @@ optim:
         # other. Proportions don't need to sum to 1 -- pick_sampling_
         # strategy normalizes automatically, so plain relative weights
         # (1 vs 0) are enough to express "on"/"off".
-        mix: _connected_list(mix -- pure_bfs, even_mix, no_bfs | pure_bfs, even_mix, no_bfs)
+        mix: _connected_list(mix -- pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
         inputs:
           # min_size/max_size vary together (paired, not cross-producted) across
           # three size bands -- two tight ones (case30, case118), plus a "wide"
@@ -196,26 +196,29 @@ optim:
           # pick_sampling_strategy for the mechanics and each strategy's
           # own docstring for what its tunable parameter does.
           #
-          # Three named blends, swept via the SAME "mix" connect key as
-          # the decoy field above (so all four proportions below move
-          # together as one unit, not cross-producted against each other):
-          # pure_bfs (the original, single-strategy behavior -- baseline),
-          # even_mix (equal parts all four), no_bfs (equal parts the other
-          # three, BFS entirely excluded -- tests whether BFS itself is
-          # doing anything special or the other three alone transfer just
-          # as well). Values are plain relative weights (1 vs 0 -- "on" vs
-          # "off"), not fractions -- see the comment above.
+          # Nine named blends, swept via the SAME "mix" connect key as the
+          # decoy field above (so all four proportions below move together
+          # as one unit, not cross-producted against each other): pure_X
+          # (X alone, the other three off) and no_X (X off, the other
+          # three equal) for each of the four strategies, plus even_mix
+          # (all four equal). pure_bfs/no_bfs are the original pair --
+          # baseline vs. "does BFS matter". The pure_X/no_X pairs for the
+          # other three strategies answer the same question for each of
+          # them individually, so you can see which single strategy (if
+          # any) is doing the heavy lifting vs. which are interchangeable.
+          # Values are plain relative weights (1 vs 0 -- "on" vs "off"),
+          # not fractions -- see the comment above.
           sampling_strategies:
             bfs:
-              proportion: _connected_list(mix -- 1, 1, 0 | pure_bfs, even_mix, no_bfs)
+              proportion: _connected_list(mix -- 1, 1, 0, 0, 0, 0, 1, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
             random_walk:
-              proportion: _connected_list(mix -- 0, 1, 1 | pure_bfs, even_mix, no_bfs)
+              proportion: _connected_list(mix -- 0, 1, 1, 1, 0, 0, 0, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
               restart_prob: 0.15
             forest_fire:
-              proportion: _connected_list(mix -- 0, 1, 1 | pure_bfs, even_mix, no_bfs)
+              proportion: _connected_list(mix -- 0, 1, 1, 0, 1, 0, 1, 0, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
               p: 0.35
             snowball:
-              proportion: _connected_list(mix -- 0, 1, 1 | pure_bfs, even_mix, no_bfs)
+              proportion: _connected_list(mix -- 0, 1, 1, 0, 0, 1, 1, 1, 0 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
               degree_weight_power: 1.0
           detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
                                  # false for symmetric/joint gradients instead
@@ -306,26 +309,26 @@ optim:
       subgraphs_per_sample: 4
       # Matches train_loss[0]'s subproblem_consistency component above, so
       # val reports consistency under the same strategy mix the job is
-      # actually training with -- same "mix" connect key, same three
-      # blends (see the train-side comment for what pure_bfs/even_mix/
-      # no_bfs mean). No decoy field needed here (unlike the train-side
-      # "mix" sibling to weight/inputs) -- this whole val_loss entry is
-      # passed straight through as kwargs to SubproblemConsistencyLoss
-      # (no combined_loss wrapper filtering it first, unlike train's), so
-      # an extra top-level key here would crash as an unexpected kwarg;
+      # actually training with -- same "mix" connect key, same nine
+      # blends (see the train-side comment for what pure_X/even_mix/no_X
+      # mean). No decoy field needed here (unlike the train-side "mix"
+      # sibling to weight/inputs) -- this whole val_loss entry is passed
+      # straight through as kwargs to SubproblemConsistencyLoss (no
+      # combined_loss wrapper filtering it first, unlike train's), so an
+      # extra top-level key here would crash as an unexpected kwarg;
       # sampling_strategies itself is a real, expected parameter, so its
       # own nested proportion fields are safe.
       sampling_strategies:
         bfs:
-          proportion: _connected_list(mix -- 1, 1, 0 | pure_bfs, even_mix, no_bfs)
+          proportion: _connected_list(mix -- 1, 1, 0, 0, 0, 0, 1, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
         random_walk:
-          proportion: _connected_list(mix -- 0, 1, 1 | pure_bfs, even_mix, no_bfs)
+          proportion: _connected_list(mix -- 0, 1, 1, 1, 0, 0, 0, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
           restart_prob: 0.15
         forest_fire:
-          proportion: _connected_list(mix -- 0, 1, 1 | pure_bfs, even_mix, no_bfs)
+          proportion: _connected_list(mix -- 0, 1, 1, 0, 1, 0, 1, 0, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
           p: 0.35
         snowball:
-          proportion: _connected_list(mix -- 0, 1, 1 | pure_bfs, even_mix, no_bfs)
+          proportion: _connected_list(mix -- 0, 1, 1, 0, 0, 1, 1, 1, 0 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
           degree_weight_power: 1.0
       detach_teacher: true
       voltage_weight: 1.0
