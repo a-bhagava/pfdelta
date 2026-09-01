@@ -16,6 +16,14 @@ import argparse
 import copy
 import json
 import os
+import sys
+
+# Matches the convention every other script/ entry point in this repo uses
+# (see scripts/find_best_run.py, scripts/task31_error.py, etc.) -- lets
+# "core.*" resolve when this is invoked as `python scripts/foo.py` from the
+# repo root, since that puts scripts/ (not the repo root) on sys.path by
+# default.
+sys.path.append(os.getcwd())
 
 import torch
 import yaml
