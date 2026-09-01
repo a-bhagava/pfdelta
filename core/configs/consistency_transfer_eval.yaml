@@ -31,8 +31,7 @@
 #      as model_path/output_dir are both given explicitly too.
 #   3. Default place to write consistency_transfer_eval.json/.png --
 #      override with output_dir.
-source_run: runs/canos_task_3_1_joint_train/<run_name_here>
-
+source_run: runs/canos_task_3_1_joint_train_0828_tinysg/canos_sgband_5_w_sg_cons1e-2_w_sg_pbl10_task_3_1_joint_0828_tinysg_6_260829_014138
 # Uncomment to bypass source_run's config.yaml for the architecture
 # entirely (e.g. if you only have a bare model_path, or its config.yaml
 # is missing/wrong) -- fill in whichever of these source_run's own
@@ -70,24 +69,30 @@ cases:
   - case500
 
 size_bands:
-  - name: tiny
+  - name: 5
     min_size: 3
     max_size: 7
-  - name: medium
+  - name: 14
     min_size: 10
-    max_size: 20
-  - name: large
+    max_size: 18
+  - name: 30
     min_size: 24
     max_size: 36
+  - name: 57
+    min_size: 49
+    max_size: 65
+  - name: 118
+    min_size: 110
+    max_size: 126
 
-batch_size: 64
+batch_size: 128
 subgraphs_per_sample: 4
 seed: 11
 detach_teacher: true
 # Optional -- same sampling_strategies schema as a training config's
 # subproblem_consistency entry (see core.utils.create_subproblem.
 # SAMPLING_STRATEGIES). Omit (or leave null) for plain BFS.
-sampling_strategies: null
+sampling_strategies: bfs
 
 # "cuda" if available, else "cpu" -- override if you want to force one.
 device: null
