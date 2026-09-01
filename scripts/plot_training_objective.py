@@ -202,15 +202,15 @@ if __name__ == "__main__":
         help="Log-scale the y-axis on both plots.",
     )
     args = parser.parse_args()
-
+    print(f"Searching for folder with name {args.run_name}")
     run_path = find_run_folder(args.run_name)
     assert run_path is not None, "Run not found!"
     print(f"Run name found in path: {run_path}")
 
     config, train_data, val_data = load_run(run_path)
 
-    objective_path = f"plot_training_objective_{args.run_name}.png"
-    pbl_path = f"plot_universal_pbl_{args.run_name}.png"
+    objective_path = f"{run_path}/plot_training_objective.png"
+    pbl_path = f"{run_path}/plot_universal_pbl.png"
 
     train_key, w2, w3, subgraph_pbl_key = plot_training_objective(
         args.run_name, config, train_data, val_data, objective_path, log=args.log

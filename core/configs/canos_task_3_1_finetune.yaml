@@ -78,7 +78,7 @@ dataset:
     task: 1.3
 functional:
   run_location: canos_task_3_1_finetune
-  run_name: canos_k_steps15_hd256_lr1e-4_sgband_%min_size_w_sg_cons%w_sg_cons_w_sg_pbl%w_sg_pbl_task_3_1_finetune
+  run_name: canos_lr1e-4_sgband_%min_size_w_sg_cons%w_sg_cons_w_sg_pbl%w_sg_pbl_task_3_1_finetune
   is_debug: false
   seed: 11
   cpu: false
@@ -106,7 +106,7 @@ optim:
     weight_decay: 0.0
   train_params:
     batch_size: 64
-    epochs: 80
+    epochs: 100
     train_loss:
     # Flat N-way combined_loss: total = 1.0*PBL + w2*consistency + w3*subgraph
     # power-balance (universal_power_balance's weight is fixed at 1 by simply
@@ -131,8 +131,8 @@ optim:
         # whichever sweep's substitution runs first, silently hiding the
         # other). The decoy's own key must be UNIQUE too -- naming both
         # decoys "weight_label" would hit this exact same collision again.
-        weight: _connected_list(consw -- 0.01, 0.1 | 0.01, 0.1)
-        w_sg_cons: _connected_list(consw -- 0.01, 0.1 | 0.01, 0.1)
+        weight: _connected_list(consw -- 1e-3, 1e-2, 1e-1 | 0.001, 0.01, 0.1)
+        w_sg_cons: _connected_list(consw -- 1e-3, 1e-2, 1e-1 | 0.001, 0.01, 0.1)
         inputs:
           # min_size/max_size vary together (paired, not cross-producted) across
           # three size bands -- two tight ones (case30, case118), plus a "wide"
@@ -140,8 +140,8 @@ optim:
           # subgraph sizes transfers better overall than specializing to one
           # target size. Shares the "sgband" key with case_name/use_first_only
           # above and below (must all stay the same length).
-          min_size: _connected_list(sgband -- 24, 100, 10 | 30, 118, wide)
-          max_size: _connected_list(sgband -- 36, 136, 136 | 30, 118, wide)
+          min_size: _connected_list(sgband -- 3, 3 | 4, 5)
+          max_size: _connected_list(sgband -- 5, 7 | 4, 5)
           detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
                                  # false for symmetric/joint gradients instead
           voltage_weight: 1.0
@@ -158,8 +158,8 @@ optim:
         # key, independent of consw/sgband -- see the comment on w2 above for
         # why subgraph_pbl_weight_label (a second, identically-swept, but
         # UNIQUELY NAMED key) exists at all.
-        weight: _connected_list(pblw -- 0.1, 1 | 0.1, 1)
-        w_sg_pbl: _connected_list(pblw -- 0.1, 1 | 0.1, 1)
+        weight: _connected_list(pblw -- 10, 100 | 10, 100)
+        w_sg_pbl: _connected_list(pblw -- 10, 100 | 10, 100)
         inputs:
           recycled_parameter: pbl_loss
           loss_name: "Subgraph power balance"
@@ -186,7 +186,7 @@ optim:
       loss2: pf_constraint_violation
       name: combined_loss
   val_params:
-    batch_size: 64
+    batch_size: 128
     # early_stop:
     #   decrease_by: 0.01
     #   decrease_for: 20
@@ -206,8 +206,8 @@ optim:
     # train_loss[0]'s subproblem_consistency component above, so each job
     # evaluates consistency at whatever size band it's actually training at.
     - name: subproblem_consistency
-      min_size: _connected_list(sgband -- 24, 100, 10 | 30, 118, wide)
-      max_size: _connected_list(sgband -- 36, 136, 136 | 30, 118, wide)
+      min_size: _connected_list(sgband -- 3, 3 | 4, 5)
+      max_size: _connected_list(sgband -- 5, 7 | 4, 5)
       detach_teacher: true
       voltage_weight: 1.0
       injection_weight: 1.0
