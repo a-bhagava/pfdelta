@@ -92,7 +92,7 @@ detach_teacher: true
 # Optional -- same sampling_strategies schema as a training config's
 # subproblem_consistency entry (see core.utils.create_subproblem.
 # SAMPLING_STRATEGIES). Omit (or leave null) for plain BFS.
-sampling_strategies: bfs
+sampling_strategies: null
 
 # "cuda" if available, else "cpu" -- override if you want to force one.
 device: null
