@@ -274,7 +274,11 @@ def main(config_path: str) -> dict:
     os.makedirs(output_dir, exist_ok=True)
 
     case_names = cfg["cases"]
-    band_names = [b["name"] for b in cfg["size_bands"]]
+    # str() here, not just at the YAML source -- size_bands' "name" is free
+    # text (yours are numeric, e.g. 5/14/30/118, matching case sizes), but
+    # print_matrix/plot_heatmap format these as table/axis labels
+    # (.rjust/.ljust, tick labels), which require actual strings.
+    band_names = [str(b["name"]) for b in cfg["size_bands"]]
 
     print(f"Loading reference dataset ({case_names[0]}, split={cfg['split']}) for model construction...")
     reference_dataset = build_dataset(
@@ -307,7 +311,7 @@ def main(config_path: str) -> dict:
                     f"already reaches the case's own bus count, so every draw would just "
                     f"return the whole case (no real cut, no GPU time wasted on it)."
                 )
-                results[(case_name, band["name"])] = None
+                results[(case_name, str(band["name"]))] = None
                 continue
             if status == "partial":
                 print(
@@ -332,7 +336,7 @@ def main(config_path: str) -> dict:
                 cfg.get("detach_teacher", True),
                 device,
             )
-            results[(case_name, band["name"])] = metrics
+            results[(case_name, str(band["name"]))] = metrics
             print(f"  -> consistency loss = {metrics['loss']:.6f}")
 
     print("\nConsistency loss matrix (rows=case, columns=size band):")
