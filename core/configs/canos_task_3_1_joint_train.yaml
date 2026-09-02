@@ -87,15 +87,18 @@ functional:
   seed: 11
   cpu: false
   trainer_name: subgraph_finetune_trainer
-  # val_loss's subproblem_consistency entry (below) only actually runs on
-  # this val dataset index -- 4 is dataset.datasets[5] (case500, split:
-  # val -- the last entry), matching val_num in calc_one_val_error (0-indexed
-  # into dataset.datasets[1:]: 0=case14, 1=case30, 2=case57, 3=case118,
-  # 4=case500). It doesn't make sense to cut a subgraph out of
-  # case14/30/57/118 and compare it against ITS OWN full-grid prediction the
-  # way it does for case500 (the source grid these subgraphs are meant to
-  # approximate) -- see SubgraphFinetuneTrainer.calc_one_val_error.
-  consistency_val_indices: [4]
+  # val_loss's subproblem_consistency entry (below) actually runs on every
+  # val dataset now -- all 5 indices (0-indexed into dataset.datasets[1:],
+  # matching val_num in calc_one_val_error: 0=case14, 1=case30, 2=case57,
+  # 3=case118, 4=case500). Originally restricted to just [4] (case500) on
+  # the reasoning that cutting a subgraph out of case14/30/57/118 and
+  # comparing it against ITS OWN full-grid prediction didn't make sense --
+  # but now that min_size/max_size (see sgband below) are small enough to
+  # be genuine cuts even relative to the smallest cases (not just case500,
+  # the source grid these subgraphs were originally meant to approximate),
+  # every val dataset gets a real, meaningful number instead of a NaN
+  # stand-in -- see SubgraphFinetuneTrainer.calc_one_val_error.
+  consistency_val_indices: [0, 1, 2, 3, 4]
 model:
   dataset: _include_
   hidden_dim: 256  # fixed (not swept) -- matches the checkpoint
@@ -287,6 +290,30 @@ optim:
       recycled_parameter: per_strategy_loss.snowball
       loss_name: "Consistency [snowball]"
       keyword: finetune_consistency
+    # Same per-strategy breakdown, but for the subgraph power-balance
+    # residual (SubproblemConsistencyLoss.per_strategy_pbl_loss) instead of
+    # the weighted consistency total above -- i.e. how physically violated
+    # each strategy's cut subgraph is on its own, independent of how the
+    # voltage/injection/edge terms weigh it into .loss. Same keyword
+    # (finetune_subgraph_pbl) as "Subgraph power balance subtotal" above --
+    # both route to the same subproblem_consistency instance, just reading
+    # a different attribute.
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.bfs
+      loss_name: "Subgraph PBL [bfs]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.random_walk
+      loss_name: "Subgraph PBL [random_walk]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.forest_fire
+      loss_name: "Subgraph PBL [forest_fire]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.snowball
+      loss_name: "Subgraph PBL [snowball]"
+      keyword: finetune_subgraph_pbl
   val_params:
     batch_size: 128
     # Re-enabled (commented out in the finetune config, since an 80-epoch
@@ -296,13 +323,12 @@ optim:
     val_loss:
     - model: CANOS
       name: universal_power_balance
-    # Only actually evaluated on val dataset index 4 (case500) -- see
-    # functional.consistency_val_indices above; a NaN-returning stand-in
-    # runs in its place for case14/30/57/118 (no subgraph gets built for
-    # them). min_size/max_size/subgraphs_per_sample reuse the exact same
-    # sgband-tagged values as train_loss[0]'s subproblem_consistency
-    # component above, so each job evaluates consistency at whatever size
-    # band/subgraph count it's actually training at.
+    # Actually evaluated on every val dataset now -- see
+    # functional.consistency_val_indices above (all 5 indices). min_size/
+    # max_size/subgraphs_per_sample reuse the exact same sgband-tagged
+    # values as train_loss[0]'s subproblem_consistency component above, so
+    # each job evaluates consistency at whatever size band/subgraph count
+    # it's actually training at, on case14/30/57/118 as well as case500.
     - name: subproblem_consistency
       min_size: _connected_list(sgband -- 24, 10 | 30, wide)
       max_size: _connected_list(sgband -- 36, 125 | 30, wide)
@@ -344,15 +370,11 @@ optim:
     # subproblem_consistency entry just above for free (see
     # SubgraphFinetuneTrainer._wire_recycle_losses, which wires a
     # recycle_loss found in val_loss to val_loss's OWN subproblem_
-    # consistency instance, not train's -- they're separate objects). Only
-    # meaningful on val dataset index 4, same as the entry above --
-    # calc_one_val_error's swap also catches this entry specifically
-    # (not just the subproblem_consistency entry itself) and replaces it
-    # with the same NaN stand-in for every other val dataset, since
-    # otherwise it would read whatever .pbl_loss was left over on the
-    # shared instance from the last time consistency actually ran (case500,
-    # possibly a previous epoch) rather than something meaningful to
-    # case14/30/57/118.
+    # consistency instance, not train's -- they're separate objects). Real
+    # (not NaN) on every val dataset now, same as the entry above --
+    # calc_one_val_error's swap (which also catches this entry, not just
+    # subproblem_consistency itself) is now effectively a no-op here since
+    # consistency_val_indices covers every val_num.
     - name: recycle_loss
       recycled_parameter: pbl_loss
       loss_name: "Subgraph power balance subtotal (unweighted)"
@@ -362,8 +384,8 @@ optim:
     # SubgraphFinetuneTrainer.calc_one_val_error's existing swap (it
     # matches any RecycleLoss whose .source is a SubproblemConsistencyLoss
     # instance, not just specific keywords), so these correctly read NaN
-    # on case14/30/57/118 exactly like the entry above, with no trainer
-    # changes needed.
+    # on whichever val datasets aren't in consistency_val_indices, exactly
+    # like the entry above, with no trainer changes needed.
     - name: recycle_loss
       recycled_parameter: per_strategy_loss.bfs
       loss_name: "Consistency [bfs]"
@@ -380,3 +402,23 @@ optim:
       recycled_parameter: per_strategy_loss.snowball
       loss_name: "Consistency [snowball]"
       keyword: finetune_consistency
+    # Same per-strategy breakdown, but for the subgraph power-balance
+    # residual instead of the weighted consistency total -- see the
+    # train-side comment above for what this reads and why. Same keyword
+    # (finetune_subgraph_pbl) as "Subgraph power balance subtotal" above.
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.bfs
+      loss_name: "Subgraph PBL [bfs]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.random_walk
+      loss_name: "Subgraph PBL [random_walk]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.forest_fire
+      loss_name: "Subgraph PBL [forest_fire]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.snowball
+      loss_name: "Subgraph PBL [snowball]"
+      keyword: finetune_subgraph_pbl

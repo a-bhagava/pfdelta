@@ -28,6 +28,16 @@ finetune.yaml / canos_task_3_1_joint_train.yaml style configs):
    gracefully (with a printed note, not an error) for a run that didn't
    configure sampling_strategies, so this script still works on any
    subgraph_finetune_trainer run either way.
+
+4. Subgraph PBL (the physical power-balance residual on each strategy's
+   own cut subgraph, independent of the voltage/injection/edge terms that
+   also feed into per_strategy_loss above -- see SubproblemConsistencyLoss.
+   per_strategy_pbl_loss) broken down by sampling strategy, one subplot per
+   val case that actually ran subproblem_consistency for real (see
+   functional.consistency_val_indices -- with small enough subgraph sizes
+   this is typically every val case, not just case500 like plot 3 above).
+   Reads the "Subgraph PBL [<name>]" keys. Same graceful skip as plot 3 if
+   sampling_strategies wasn't configured.
 """
 import os
 import glob
@@ -81,13 +91,39 @@ def load_run(run_folder):
     return config, train_data, val_data
 
 
+def get_consistency_val_indices(config):
+    """Every val_num subproblem_consistency actually runs on for real (not
+    swapped for the NaN stand-in) -- see functional.consistency_val_indices
+    and SubgraphFinetuneTrainer.calc_one_val_error. Used to be just [4]
+    (case500 only); now commonly all of dataset.datasets[1:] once subgraph
+    sizes are small enough to be a genuine cut on every case, not just the
+    training one."""
+    return config["functional"].get("consistency_val_indices", [])
+
+
 def get_case500_val_index(config):
-    indices = config["functional"].get("consistency_val_indices", [])
-    assert len(indices) == 1, (
-        f"expected exactly one consistency_val_indices entry, got {indices} -- "
-        "this script assumes a single designated same-distribution val set."
+    """The val dataset index matching the TRAINING case (named case500 in
+    this run, but identified here by matching dataset.datasets[0]'s own
+    case_name rather than assuming position 4 or that it's the only
+    consistency_val_indices entry) -- the one same-distribution val set
+    plot_training_objective reconstructs the actual backpropagated
+    objective against. Asserts it's actually one of consistency_val_indices
+    (it always should be -- that would be a config mistake otherwise, not
+    something to silently paper over)."""
+    case_names = get_val_case_names(config)
+    train_case_name = config["dataset"]["datasets"][0]["case_name"]
+    assert train_case_name in case_names, (
+        f"training case {train_case_name!r} has no matching val dataset -- "
+        f"val case names are {case_names}"
     )
-    return indices[0]
+    idx = case_names.index(train_case_name)
+    indices = get_consistency_val_indices(config)
+    assert idx in indices, (
+        f"val index {idx} ({train_case_name}) isn't in consistency_val_indices "
+        f"{indices} -- subproblem_consistency never actually ran on the "
+        "training case's own val set, so there's nothing to reconstruct."
+    )
+    return idx
 
 
 def get_val_case_names(config):
@@ -278,14 +314,100 @@ def plot_per_strategy_consistency(run_name, config, train_data, val_data, out_pa
     return available
 
 
+def plot_per_strategy_subgraph_pbl(run_name, config, train_data, val_data, out_path, log=False):
+    """Subgraph power-balance residual (SubproblemConsistencyLoss.
+    per_strategy_pbl_loss -- how physically violated each strategy's own
+    cut subgraph is, independent of the voltage/injection/edge terms that
+    also feed into per-strategy consistency), one subplot per val dataset
+    that actually ran subproblem_consistency for real (see
+    functional.consistency_val_indices -- with small enough subgraph sizes
+    this is typically every val case now, not just case500), each showing
+    one line per configured sampling strategy: train (solid, same across
+    every subplot -- train_loss[0] only ever runs on the training case) and
+    that subplot's own val case (dashed). Returns the list of strategy
+    names actually plotted, or None if this run didn't configure
+    sampling_strategies / doesn't have the corresponding train.json keys --
+    a no-op, not an error, so callers can just skip it (and any downstream
+    file it would have produced) when it returns None.
+    """
+    strategy_names = get_sampling_strategy_names(config)
+    if not strategy_names:
+        print("No sampling_strategies configured for this run -- skipping per-strategy subgraph-PBL plot.")
+        return None
+
+    train_epochs = _sorted_epochs(train_data)
+    val_epochs = _sorted_epochs(val_data)
+    val_indices = get_consistency_val_indices(config)
+    val_case_names = get_val_case_names(config)
+    if not val_indices:
+        print("consistency_val_indices is empty -- subproblem_consistency never ran on any val set, skipping.")
+        return None
+
+    first_epoch_keys = train_data[train_epochs[0]].keys()
+    available = [name for name in strategy_names if f"Subgraph PBL [{name}]" in first_epoch_keys]
+    missing = [name for name in strategy_names if name not in available]
+    if missing:
+        print(
+            f"Note: no 'Subgraph PBL [<name>]' key in train.json for: {missing} "
+            "(older run, or config didn't wire per-strategy recycle_loss entries for it)"
+        )
+    if not available:
+        print("None of the configured strategies have a matching train.json key -- skipping per-strategy subgraph-PBL plot.")
+        return None
+
+    colors = plt.cm.tab10.colors
+    fig, axes = plt.subplots(
+        1, len(val_indices), figsize=(5 * len(val_indices), 5),
+        sharey=True, squeeze=False,
+    )
+    axes = axes[0]
+    train_x = list(map(int, train_epochs))
+    val_x = list(map(int, val_epochs))
+    for ax, val_idx in zip(axes, val_indices):
+        case_name = val_case_names[val_idx]
+        for i, name in enumerate(available):
+            key = f"Subgraph PBL [{name}]"
+            color = colors[i % len(colors)]
+            train_vals = [train_data[e].get(key) for e in train_epochs]
+            ax.plot(train_x, train_vals, linestyle="-", color=color, linewidth=1.5)
+            if all(key in val_data[e][val_idx] for e in val_epochs):
+                val_vals = [val_data[e][val_idx].get(key) for e in val_epochs]
+                ax.plot(val_x, val_vals, linestyle="--", color=color, alpha=0.7, linewidth=1.5)
+        ax.set_title(f"{case_name} (val {val_idx})")
+        ax.set_xlabel("Training point")
+        if log:
+            ax.set_yscale("log")
+        ax.grid(True, alpha=0.3)
+    axes[0].set_ylabel("Subgraph PBL (weighted, per sampling strategy)")
+
+    # One shared legend: strategy colors + what solid/dashed mean -- built
+    # from proxy handles rather than per-subplot ones, since each subplot's
+    # actual line objects only cover strategies with real data there.
+    from matplotlib.lines import Line2D
+    handles = [Line2D([0], [0], color=colors[i % len(colors)], label=name) for i, name in enumerate(available)]
+    handles += [
+        Line2D([0], [0], color="black", linestyle="-", label="train"),
+        Line2D([0], [0], color="black", linestyle="--", alpha=0.7, label="val"),
+    ]
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.08), ncol=len(handles))
+    fig.suptitle(f"{run_name} - subgraph PBL by sampling strategy, per val case", y=1.15)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    print(f"Saved {out_path}")
+    return available
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "Plot (1) the actual weighted training objective vs. the same "
             "combination reconstructed on the case500 (same-distribution) "
             "val set, (2) universal PBL on every validation set "
-            "separately, and (3) consistency loss broken down by sampling "
-            "strategy (if the run configured sampling_strategies), for a "
+            "separately, (3) consistency loss broken down by sampling "
+            "strategy on case500 (if the run configured sampling_"
+            "strategies), and (4) subgraph PBL broken down by sampling "
+            "strategy on every val case that actually ran subproblem_"
+            "consistency (see functional.consistency_val_indices), for a "
             "subgraph_finetune_trainer run."
         )
     )
@@ -304,14 +426,18 @@ if __name__ == "__main__":
 
     objective_path = f"{run_path}/plot_training_objective.png"
     pbl_path = f"{run_path}/plot_universal_pbl.png"
-    per_strategy_path = f"{run_path}/plot_per_strategy_consistency.png"
+    per_strategy_consistency_path = f"{run_path}/plot_per_strategy_consistency.png"
+    per_strategy_pbl_path = f"{run_path}/plot_per_strategy_subgraph_pbl.png"
 
     train_key, w2, w3, subgraph_pbl_key = plot_training_objective(
         args.run_name, config, train_data, val_data, objective_path, log=args.log
     )
     plot_universal_pbl(args.run_name, config, val_data, pbl_path, log=args.log)
     plotted_strategies = plot_per_strategy_consistency(
-        args.run_name, config, train_data, val_data, per_strategy_path, log=args.log
+        args.run_name, config, train_data, val_data, per_strategy_consistency_path, log=args.log
+    )
+    plotted_pbl_strategies = plot_per_strategy_subgraph_pbl(
+        args.run_name, config, train_data, val_data, per_strategy_pbl_path, log=args.log
     )
 
     print()
@@ -319,4 +445,6 @@ if __name__ == "__main__":
     print(f"Reconstruction weights: w2 (consistency) = {w2}, w3 (subgraph-PBL) = {w3}")
     print(f"Subgraph-PBL val.json key: {subgraph_pbl_key!r}")
     if plotted_strategies:
-        print(f"Sampling strategies plotted: {plotted_strategies}")
+        print(f"Sampling strategies plotted (per-strategy consistency, case500): {plotted_strategies}")
+    if plotted_pbl_strategies:
+        print(f"Sampling strategies plotted (per-strategy subgraph PBL, all val cases): {plotted_pbl_strategies}")
