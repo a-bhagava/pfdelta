@@ -106,7 +106,7 @@ optim:
     name: Adam
     weight_decay: 0.0
   train_params:
-    batch_size: 64
+    batch_size: 128
     epochs: 100
     train_loss:
     # Flat N-way combined_loss: total = 1.0*PBL + w2*consistency + w3*subgraph
