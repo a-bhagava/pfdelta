@@ -49,6 +49,11 @@ class PFDeltaGNS(PFDeltaDataset):
         Filter function applied to data objects before processing.
     force_reload : bool, optional
         If True, forces dataset reprocessing. Defaults to False.
+    branch_perturbation_sigma : float, optional
+        Std of multiplicative noise applied to each branch's physical
+        parameters every __getitem__ call (see PFDeltaDataset /
+        core.datasets.dataset_utils.branch_perturbation_transform).
+        0.0 (default) disables it.
 
     Notes
     -----
@@ -71,6 +76,7 @@ class PFDeltaGNS(PFDeltaDataset):
         pre_transform=None,
         pre_filter=None,
         force_reload=False,
+        branch_perturbation_sigma=0.0,
     ):
         super().__init__(
             root_dir=root_dir,
@@ -83,6 +89,7 @@ class PFDeltaGNS(PFDeltaDataset):
             pre_transform=pre_transform,
             pre_filter=pre_filter,
             force_reload=force_reload,
+            branch_perturbation_sigma=branch_perturbation_sigma,
         )
 
     def build_heterodata(self, pm_case: dict, is_cpf_sample: bool = False):
@@ -210,6 +217,13 @@ class PFDeltaCANOS(PFDeltaDataset):
         Optional filter applied to data objects before processing.
     force_reload : bool, optional
         If True, forces dataset reprocessing. Defaults to False.
+    branch_perturbation_sigma : float, optional
+        Std of multiplicative noise applied to each branch's physical
+        parameters every __getitem__ call (see PFDeltaDataset /
+        core.datasets.dataset_utils.branch_perturbation_transform) --
+        composed with `transform` above (runs after it), not a replacement
+        for it. 0.0 (default) disables it. Safe to combine with CANOS's
+        own transform/pre_transform here since neither touches edge_attr.
 
     Notes
     -----
@@ -231,6 +245,7 @@ class PFDeltaCANOS(PFDeltaDataset):
         pre_transform=None,
         pre_filter=None,
         force_reload=False,
+        branch_perturbation_sigma=0.0,
     ):
         if pre_transform is not None:
             if pre_transform == "canos_pf_data_mean0_var1":
@@ -253,6 +268,7 @@ class PFDeltaCANOS(PFDeltaDataset):
             pre_transform=pre_transform,
             pre_filter=pre_filter,
             force_reload=force_reload,
+            branch_perturbation_sigma=branch_perturbation_sigma,
         )
 
     def build_heterodata(self, pm_case: dict, is_cpf_sample: bool = False):
@@ -338,6 +354,17 @@ class PFDeltaPFNet(PFDeltaDataset):
         Optional filter applied to data objects before processing.
     force_reload : bool, optional
         If True, forces dataset reprocessing. Defaults to False.
+    branch_perturbation_sigma : float, optional
+        Std of multiplicative noise applied to each branch's physical
+        parameters every __getitem__ call (see PFDeltaDataset /
+        core.datasets.dataset_utils.branch_perturbation_transform) --
+        composed with `transform` above (runs after it), not a replacement
+        for it. 0.0 (default) disables it. NOTE: unlike CANOS/GNS, PFNet's
+        own pre_transform (pfnet_data_mean0_var1) already normalizes
+        edge_attr to mean0/var1 before this ever runs, so the noise here
+        ends up perturbing the normalized value, not the raw physical one
+        -- a real augmentation, just not "sigma as a fraction of the
+        physical parameter" the way it is for CANOS/GNS.
 
     Notes
     -----
@@ -362,6 +389,7 @@ class PFDeltaPFNet(PFDeltaDataset):
         pre_filter=None,
         force_reload=False,
         normalized_case_name=None,
+        branch_perturbation_sigma=0.0,
     ):
         self.normalized_case_name = normalized_case_name
 
@@ -389,6 +417,7 @@ class PFDeltaPFNet(PFDeltaDataset):
             pre_transform=pre_transform,
             pre_filter=pre_filter,
             force_reload=force_reload,
+            branch_perturbation_sigma=branch_perturbation_sigma,
         )
 
     def build_heterodata(self, pm_case: dict, is_cpf_sample: bool = False):

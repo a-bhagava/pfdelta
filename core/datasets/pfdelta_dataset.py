@@ -15,6 +15,7 @@ from torch_geometric.data import (
 )
 
 from core.utils.registry import registry
+from core.datasets.dataset_utils import branch_perturbation_transform
 
 
 @registry.register_dataset("pfdeltadata")
@@ -53,9 +54,10 @@ class PFDeltaDataset(InMemoryDataset):
         pre_transform: Any = None,
         pre_filter: Any = None,
         force_reload: bool = False,
+        branch_perturbation_sigma: float = 0.0,
     ):
         """
-        Initialize the PFDeltaDataset class. 
+        Initialize the PFDeltaDataset class.
 
         Parameters
         ----------
@@ -70,7 +72,7 @@ class PFDeltaDataset(InMemoryDataset):
         n_samples : int
             Number of samples to load. If < 0, loads all available samples.
         split : str
-            Dataset split to load ("train", "val", "test", "all", or 
+            Dataset split to load ("train", "val", "test", "all", or
             "separate_{casename}_{split}_{feasibility}_{grid_type}").
         model : str
             Model shorthand used for processed dataset naming.
@@ -82,6 +84,15 @@ class PFDeltaDataset(InMemoryDataset):
             PyTorch Geometric dataset hooks for on-the-fly or preprocessing transforms.
         force_reload : bool
             If True, forces the dataset to reprocess even if cache exists.
+        branch_perturbation_sigma : float
+            Std of multiplicative noise applied to each branch's physical
+            parameters (see core.datasets.dataset_utils.
+            branch_perturbation_transform) -- 0.0 (default) disables it.
+            Composed with `transform` (applied after it, if both are given)
+            rather than replacing it, and re-drawn fresh every __getitem__
+            call (a `transform`, not a `pre_transform` -- so every epoch
+            gets an independent perturbation, unlike the baked-in,
+            topological N-1/N-2 `perturbation` param above).
 
         Notes
         -----
@@ -212,6 +223,17 @@ class PFDeltaDataset(InMemoryDataset):
                 "test": ["case14", "case30", "case57"],
             },
         }
+
+        self.branch_perturbation_sigma = float(branch_perturbation_sigma)
+        if self.branch_perturbation_sigma > 0.0:
+            perturb = branch_perturbation_transform(self.branch_perturbation_sigma)
+            if transform is not None:
+                base_transform = transform
+
+                def transform(data, _base=base_transform, _perturb=perturb):
+                    return _perturb(_base(data))
+            else:
+                transform = perturb
 
         super().__init__(
             self.root, transform, pre_transform, pre_filter, force_reload=force_reload
