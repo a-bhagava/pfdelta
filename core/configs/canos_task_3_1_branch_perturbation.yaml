@@ -1,0 +1,443 @@
+config_type: simple_batch
+job_parameters:
+  # Same routing as canos_task_3_1_finetune.yaml -- any of these partitions,
+  # 1 h200. A full from-scratch run (200 epochs, see optim.train_params.
+  # epochs below) needs more requeue cycles than an 80-epoch finetune under
+  # this same 6h per-allocation limit, but requeue/USR1 checkpointing below
+  # already handles that.
+  p: mit_normal_gpu,mit_preemptable,pi_donti_gpu
+  gres: gpu:h200:1
+  requeue: __novalue__
+  body: "source ~/.bashrc\nconda activate pfdelta2\nexec __launch__"
+  mem: 64G
+  output: canos_hyperparam_joint_branch_perturbation_%j.out
+  signal: USR1@90
+  time: "05:59:00"
+# Subgraph-consistency augmentation baked in from the START of training
+# (PFDelta task 3.1), rather than as a separate finetuning stage applied to
+# an already-converged checkpoint -- contrast with canos_task_3_1_finetune.
+# yaml, which warm-starts from a plain canos_task_1_3.yaml run (case500
+# only, no consistency term) and finetunes briefly (80 epochs, small lr, no
+# warmup) with the consistency/subgraph-PBL terms added on top.
+#
+# Here there's no model.pretrained_path -- GNNTrainer's normal (random)
+# initialization is used, and the SAME combined objective (universal_power_
+# balance + w2*consistency + w3*subgraph-PBL) is optimized for the entire
+# training run, on the same case500 train split canos_task_1_3.yaml uses.
+# epochs/lr/lr_scheduler/early_stop below are copied from canos_task_1_3.
+# yaml's own from-scratch regime (a short finetune-style schedule -- low
+# fixed lr, no warmup -- would badly undertrain a randomly-initialized
+# model), not from the finetune config's short/low-lr settings.
+#
+# Everything else (loss structure, sgband/consw/pblw sweeps, val datasets,
+# consistency_val_indices, subgraphs_per_sample, trainer) is unchanged from
+# canos_task_3_1_finetune.yaml, so results between the two configs are
+# directly comparable: same architecture (hidden_dim/k_steps fixed to match
+# the checkpoint the finetune config warm-starts from), same augmentation,
+# same size bands and loss weights swept the same way.
+#
+# ONE further addition on top of canos_task_3_1_joint_train.yaml (this
+# config is otherwise identical to it, feature-for-feature -- see that
+# file's own history for how sgband/consw/pblw/mix reached their current
+# values): case500's train dataset entry below also gets
+# branch_perturbation_sigma: 0.05 -- every __getitem__ call multiplicatively
+# perturbs each branch's physical parameters (resistance/reactance/shunt
+# admittance, not tap ratio/phase shift) by independent noise centered at
+# 1 with std 0.05, redrawn fresh every epoch (see core.datasets.
+# dataset_utils.branch_perturbation_transform / PFDeltaDataset). Not
+# applied to any val dataset -- val_loss (both the plain supervised terms
+# and subproblem_consistency) compares against ground truth solved for the
+# ORIGINAL grid, so perturbing val inputs would just make the comparison
+# wrong rather than testing anything. To sweep sigma instead of this one
+# fixed value, replace 0.05 below with e.g. _manual_list(0.0, 0.05, 0.1 |
+# 0.0, 0.05, 0.1) (add %branch_perturbation_sigma to run_name too) the
+# same way subgraphs_per_sample's own single-value _manual_list is used
+# purely for run_name templating elsewhere in this file.
+dataset:
+  datasets:
+  - add_bus_type: true
+    case_name: case500  # the only source of training data
+    model: CANOS
+    name: pfdeltaCANOS
+    root_dir: /orcd/pool/005/donti_shared/pfdelta_data
+    split: train
+    task: 1.3
+    branch_perturbation_sigma: 0.05
+  - add_bus_type: true
+    case_name: case14
+    model: CANOS
+    name: pfdeltaCANOS
+    root_dir: /orcd/pool/005/donti_shared/pfdelta_data
+    split: val
+    task: 1.3
+  - add_bus_type: true
+    case_name: case30
+    model: CANOS
+    name: pfdeltaCANOS
+    root_dir: /orcd/pool/005/donti_shared/pfdelta_data
+    split: val
+    task: 1.3
+  - add_bus_type: true
+    case_name: case57
+    model: CANOS
+    name: pfdeltaCANOS
+    root_dir: /orcd/pool/005/donti_shared/pfdelta_data
+    split: val
+    task: 1.3
+  - add_bus_type: true
+    case_name: case118
+    model: CANOS
+    name: pfdeltaCANOS
+    root_dir: /orcd/pool/005/donti_shared/pfdelta_data
+    split: val
+    task: 1.3
+  - add_bus_type: true
+    case_name: case500
+    model: CANOS
+    name: pfdeltaCANOS
+    root_dir: /orcd/pool/005/donti_shared/pfdelta_data
+    split: val
+    task: 1.3
+functional:
+  checkpoint: True
+  run_location: canos_task_3_1_joint_train_branch_perturbation
+  run_name: canos_sgband_%min_size_w_sg_cons%w_sg_cons_w_sg_pbl%w_sg_pbl_mix%mix_task_sgps_%subgraphs_per_sample_3_1_joint_bp0.05
+  is_debug: false
+  seed: 11
+  cpu: false
+  trainer_name: subgraph_finetune_trainer
+  # val_loss's subproblem_consistency entry (below) actually runs on every
+  # val dataset now -- all 5 indices (0-indexed into dataset.datasets[1:],
+  # matching val_num in calc_one_val_error: 0=case14, 1=case30, 2=case57,
+  # 3=case118, 4=case500). Originally restricted to just [4] (case500) on
+  # the reasoning that cutting a subgraph out of case14/30/57/118 and
+  # comparing it against ITS OWN full-grid prediction didn't make sense --
+  # but now that min_size/max_size (see sgband below) are small enough to
+  # be genuine cuts even relative to the smallest cases (not just case500,
+  # the source grid these subgraphs were originally meant to approximate),
+  # every val dataset gets a real, meaningful number instead of a NaN
+  # stand-in -- see SubgraphFinetuneTrainer.calc_one_val_error.
+  consistency_val_indices: [0, 1, 2, 3, 4]
+model:
+  dataset: _include_
+  hidden_dim: 256  # fixed (not swept) -- matches the checkpoint
+  include_sent_messages: true
+  k_steps: 15
+  name: canos_pf
+optim:
+  # From-scratch training regime, copied from canos_task_1_3.yaml -- NOT
+  # the finetune config's short/low-lr/no-warmup settings, which assume an
+  # already-converged starting point that doesn't exist here.
+  lr_scheduler:
+    milestones:
+    - 5
+    name: SequentialLR
+    schedulers:
+    - end_factor: 1
+      name: LinearLR
+      start_factor: 0.01
+    - gamma: 0.9
+      name: StepLR
+      step_size: 4
+  optimizer:
+    lr: 0.001
+    name: Adam
+    weight_decay: 0.0
+  train_params:
+    batch_size: 128
+    epochs: 200
+    train_loss:
+    # Flat N-way combined_loss: total = 1.0*PBL + w2*consistency + w3*subgraph
+    # power-balance (universal_power_balance's weight is fixed at 1 by simply
+    # not tuning it -- weight defaults to 1 when omitted).
+    - name: combined_loss
+      profile: true
+      losses:
+      - name: universal_power_balance
+        inputs:
+          model: CANOS
+      - name: subproblem_consistency
+        # w2: weight of the consistency term. Tied to its own "consw" connect
+        # key (distinct from "sgband" below and "pblw" on w3) so it sweeps
+        # independently -- cross-producted with sgband (3) and pblw (2) below
+        # for 3*2*2=12 total jobs. consistency_weight_label is a decoy:
+        # CombinedLoss only reads name/weight/inputs from each losses[] entry
+        # and ignores anything else, so this extra key is free to carry a
+        # SEPARATE %consistency_weight_label run_name placeholder -- %weight
+        # alone would be ambiguous since w3 below also uses the literal key
+        # name "weight", and a bare string .replace() can't tell them apart
+        # (both %weight occurrences in run_name would get overwritten by
+        # whichever sweep's substitution runs first, silently hiding the
+        # other). The decoy's own key must be UNIQUE too -- naming both
+        # decoys "weight_label" would hit this exact same collision again.
+        weight: _connected_list(consw -- 0.01 | 0.01)
+        w_sg_cons: _connected_list(consw -- 0.01 | 0.01)
+        # mix: which sampling-strategy blend this job uses -- own "mix"
+        # connect key, independent of consw/sgband/pblw, cross-producted
+        # with everything else (9x whatever the job count already was).
+        # A SIBLING of weight/w_sg_cons here (not inside inputs:), so
+        # CombinedLoss's own "only read name/weight/inputs, ignore
+        # everything else" behavior drops it before it ever reaches
+        # SubproblemConsistencyLoss -- it exists purely to give run_name a
+        # %mix placeholder naming which blend a job used. Its own value is
+        # unused by anything (just mirrors its own run_name label) --
+        # what actually SELECTS the blend is each strategy's own
+        # "proportion" below, tied to this SAME "mix" key so all four vary
+        # together as one unit rather than being cross-producted with each
+        # other. Proportions don't need to sum to 1 -- pick_sampling_
+        # strategy normalizes automatically, so plain relative weights
+        # (1 vs 0) are enough to express "on"/"off".
+        mix: _connected_list(mix -- pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+        inputs:
+          # min_size/max_size vary together (paired, not cross-producted) across
+          # three size bands -- two tight ones (case30, case118), plus a "wide"
+          # band spanning that whole range to test whether training on diverse
+          # subgraph sizes transfers better overall than specializing to one
+          # target size. Shares the "sgband" key with case_name/use_first_only
+          # above and below (must all stay the same length).
+          min_size: _connected_list(sgband -- 3 | 5)
+          max_size: _connected_list(sgband -- 7 | 5)
+          # 4 independent subgraph draws per case500 sample per step (own
+          # seed bus/BFS growth each -- see build_subproblem_batch), instead
+          # of just 1. Fixed here, not swept -- change to a
+          # _connected_list(...) tied to a new key if you want to sweep it
+          # later. voltage_loss/injection_loss/edge_loss/subgraph PBL are
+          # all pooled per-subgraph before being averaged (see
+          # custom_losses._per_subgraph_mse and PowerBalanceLoss's own
+          # aggregation), so a sample doesn't get 4x the gradient weight
+          # just because it contributed 4 subgraphs.
+          subgraphs_per_sample: 4
+          # Each of the subgraphs_per_sample draws independently picks one
+          # of these at random, weighted by its own "proportion" (need not
+          # sum to 1 -- normalized at draw time). Mixing per-draw rather
+          # than pinning one strategy per batch costs nothing extra here --
+          # none of these are vectorized across simultaneous draws (BFS
+          # itself isn't either), so it's just a cheap per-draw dispatch on
+          # top of whichever strategy's own cost. See
+          # core/utils/create_subproblem.py's SAMPLING_STRATEGIES/
+          # pick_sampling_strategy for the mechanics and each strategy's
+          # own docstring for what its tunable parameter does.
+          #
+          # Nine named blends, swept via the SAME "mix" connect key as the
+          # decoy field above (so all four proportions below move together
+          # as one unit, not cross-producted against each other): pure_X
+          # (X alone, the other three off) and no_X (X off, the other
+          # three equal) for each of the four strategies, plus even_mix
+          # (all four equal). pure_bfs/no_bfs are the original pair --
+          # baseline vs. "does BFS matter". The pure_X/no_X pairs for the
+          # other three strategies answer the same question for each of
+          # them individually, so you can see which single strategy (if
+          # any) is doing the heavy lifting vs. which are interchangeable.
+          # Values are plain relative weights (1 vs 0 -- "on" vs "off"),
+          # not fractions -- see the comment above.
+          sampling_strategies:
+            bfs:
+              proportion: _connected_list(mix -- 1, 1, 0, 0, 0, 0, 1, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+            random_walk:
+              proportion: _connected_list(mix -- 0, 1, 1, 1, 0, 0, 0, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+              restart_prob: 0.15
+            forest_fire:
+              proportion: _connected_list(mix -- 0, 1, 1, 0, 1, 0, 1, 0, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+              p: 0.35
+            snowball:
+              proportion: _connected_list(mix -- 0, 1, 1, 0, 0, 1, 1, 1, 0 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+              degree_weight_power: 1.0
+          detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
+                                 # false for symmetric/joint gradients instead
+          voltage_weight: 1.0
+          injection_weight: 1.0
+          edge_weight: 1.0
+          # pbl_weight left at its default (0.0): the subgraph power-balance
+          # term is its OWN independently-weighted component below (a
+          # recycle_loss reusing this same subgraph/second forward pass, no
+          # extra cost), not folded into this consistency subtotal --
+          # setting this nonzero here too would double-count it.
+          profile: true
+      - name: recycle_loss  # pulls subproblem_consistency.pbl_loss, computed just above
+        # w3: weight of the subgraph power-balance term. Own "pblw" connect
+        # key, independent of consw/sgband -- see the comment on w2 above for
+        # why subgraph_pbl_weight_label (a second, identically-swept, but
+        # UNIQUELY NAMED key) exists at all.
+        weight: _connected_list(pblw -- 10 | 10)
+        w_sg_pbl: _connected_list(pblw -- 10 | 10)
+        inputs:
+          recycled_parameter: pbl_loss
+          loss_name: "Subgraph power balance"
+          keyword: finetune_subgraph_pbl
+    # Logged only (see SubgraphFinetuneTrainer._wire_recycle_losses) -- pulls
+    # the already-computed subtotals off train_loss[0] above for free, no
+    # extra forward pass, so train.json shows all three components
+    # separately alongside the combined total (train_loss[0] itself) that
+    # actually gets backpropagated.
+    - name: recycle_loss
+      recycled_parameter: power_balance_mean
+      loss_name: "Universal power balance subtotal (PBL Mean, unweighted)"
+      keyword: finetune_supervised
+    - name: recycle_loss
+      recycled_parameter: loss
+      loss_name: "Consistency subtotal (subproblem_consistency, unweighted)"
+      keyword: finetune_consistency
+    - name: recycle_loss
+      recycled_parameter: pbl_loss
+      loss_name: "Subgraph power balance subtotal (unweighted)"
+      keyword: finetune_subgraph_pbl
+    # Per-sampling-strategy breakdown of the SAME weighted consistency
+    # total as "Consistency subtotal" above (see SubproblemConsistencyLoss.
+    # per_strategy_loss -- 1.0*voltage + 1.0*injection + 1.0*edge +
+    # pbl_weight*pbl, per strategy, mirroring .loss's own formula), so you
+    # can see whether the model is more/less self-consistent depending on
+    # which sampling strategy cut the subgraph. RecycleLoss's dotted
+    # recycled_parameter ("per_strategy_loss.<name>") reads a specific key
+    # out of that dict -- returns NaN (not a crash) for a batch where that
+    # particular strategy genuinely didn't contribute any rows, same
+    # "not evaluated here" convention used elsewhere. Same keyword
+    # (finetune_consistency) as the subtotal above -- routes to the same
+    # subproblem_consistency instance, just reading a different attribute.
+    - name: recycle_loss
+      recycled_parameter: per_strategy_loss.bfs
+      loss_name: "Consistency [bfs]"
+      keyword: finetune_consistency
+    - name: recycle_loss
+      recycled_parameter: per_strategy_loss.random_walk
+      loss_name: "Consistency [random_walk]"
+      keyword: finetune_consistency
+    - name: recycle_loss
+      recycled_parameter: per_strategy_loss.forest_fire
+      loss_name: "Consistency [forest_fire]"
+      keyword: finetune_consistency
+    - name: recycle_loss
+      recycled_parameter: per_strategy_loss.snowball
+      loss_name: "Consistency [snowball]"
+      keyword: finetune_consistency
+    # Same per-strategy breakdown, but for the subgraph power-balance
+    # residual (SubproblemConsistencyLoss.per_strategy_pbl_loss) instead of
+    # the weighted consistency total above -- i.e. how physically violated
+    # each strategy's cut subgraph is on its own, independent of how the
+    # voltage/injection/edge terms weigh it into .loss. Same keyword
+    # (finetune_subgraph_pbl) as "Subgraph power balance subtotal" above --
+    # both route to the same subproblem_consistency instance, just reading
+    # a different attribute.
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.bfs
+      loss_name: "Subgraph PBL [bfs]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.random_walk
+      loss_name: "Subgraph PBL [random_walk]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.forest_fire
+      loss_name: "Subgraph PBL [forest_fire]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.snowball
+      loss_name: "Subgraph PBL [snowball]"
+      keyword: finetune_subgraph_pbl
+  val_params:
+    batch_size: 128
+    # Re-enabled (commented out in the finetune config, since an 80-epoch
+    # finetune from an already-good checkpoint doesn't need it) -- a
+    # 200-epoch from-scratch run does, matching canos_task_1_3.yaml.
+    report_every: 1
+    val_loss:
+    - model: CANOS
+      name: universal_power_balance
+    # Actually evaluated on every val dataset now -- see
+    # functional.consistency_val_indices above (all 5 indices). min_size/
+    # max_size/subgraphs_per_sample reuse the exact same sgband-tagged
+    # values as train_loss[0]'s subproblem_consistency component above, so
+    # each job evaluates consistency at whatever size band/subgraph count
+    # it's actually training at, on case14/30/57/118 as well as case500.
+    - name: subproblem_consistency
+      min_size: _connected_list(sgband -- 3 | 5)
+      max_size: _connected_list(sgband -- 7 | 5)
+      subgraphs_per_sample: _manual_list(4 | 4)
+      # Matches train_loss[0]'s subproblem_consistency component above, so
+      # val reports consistency under the same strategy mix the job is
+      # actually training with -- same "mix" connect key, same nine
+      # blends (see the train-side comment for what pure_X/even_mix/no_X
+      # mean). No decoy field needed here (unlike the train-side "mix"
+      # sibling to weight/inputs) -- this whole val_loss entry is passed
+      # straight through as kwargs to SubproblemConsistencyLoss (no
+      # combined_loss wrapper filtering it first, unlike train's), so an
+      # extra top-level key here would crash as an unexpected kwarg;
+      # sampling_strategies itself is a real, expected parameter, so its
+      # own nested proportion fields are safe.
+      sampling_strategies:
+        bfs:
+          proportion: _connected_list(mix -- 1, 1, 0, 0, 0, 0, 1, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+        random_walk:
+          proportion: _connected_list(mix -- 0, 1, 1, 1, 0, 0, 0, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+          restart_prob: 0.15
+        forest_fire:
+          proportion: _connected_list(mix -- 0, 1, 1, 0, 1, 0, 1, 0, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+          p: 0.35
+        snowball:
+          proportion: _connected_list(mix -- 0, 1, 1, 0, 0, 1, 1, 1, 0 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+          degree_weight_power: 1.0
+      detach_teacher: true
+      voltage_weight: 1.0
+      injection_weight: 1.0
+      edge_weight: 1.0
+      # pbl_weight left at its default (0.0): the subgraph power-balance
+      # residual is reported as its OWN separate val_loss entry below
+      # (recycle_loss, reads .pbl_loss -- still computed every call
+      # regardless of pbl_weight, just not folded into this entry's own
+      # .loss/reported number when pbl_weight is 0) instead of being folded
+      # into this one, so the two show up as distinct numbers in val.json.
+    # Logged only -- pulls the subgraph PBL subtotal off the
+    # subproblem_consistency entry just above for free (see
+    # SubgraphFinetuneTrainer._wire_recycle_losses, which wires a
+    # recycle_loss found in val_loss to val_loss's OWN subproblem_
+    # consistency instance, not train's -- they're separate objects). Real
+    # (not NaN) on every val dataset now, same as the entry above --
+    # calc_one_val_error's swap (which also catches this entry, not just
+    # subproblem_consistency itself) is now effectively a no-op here since
+    # consistency_val_indices covers every val_num.
+    - name: recycle_loss
+      recycled_parameter: pbl_loss
+      loss_name: "Subgraph power balance subtotal (unweighted)"
+      keyword: finetune_subgraph_pbl
+    # Same per-strategy breakdown as train_loss[0]'s own logging entries
+    # above -- see the comment there. Automatically caught by
+    # SubgraphFinetuneTrainer.calc_one_val_error's existing swap (it
+    # matches any RecycleLoss whose .source is a SubproblemConsistencyLoss
+    # instance, not just specific keywords), so these correctly read NaN
+    # on whichever val datasets aren't in consistency_val_indices, exactly
+    # like the entry above, with no trainer changes needed.
+    - name: recycle_loss
+      recycled_parameter: per_strategy_loss.bfs
+      loss_name: "Consistency [bfs]"
+      keyword: finetune_consistency
+    - name: recycle_loss
+      recycled_parameter: per_strategy_loss.random_walk
+      loss_name: "Consistency [random_walk]"
+      keyword: finetune_consistency
+    - name: recycle_loss
+      recycled_parameter: per_strategy_loss.forest_fire
+      loss_name: "Consistency [forest_fire]"
+      keyword: finetune_consistency
+    - name: recycle_loss
+      recycled_parameter: per_strategy_loss.snowball
+      loss_name: "Consistency [snowball]"
+      keyword: finetune_consistency
+    # Same per-strategy breakdown, but for the subgraph power-balance
+    # residual instead of the weighted consistency total -- see the
+    # train-side comment above for what this reads and why. Same keyword
+    # (finetune_subgraph_pbl) as "Subgraph power balance subtotal" above.
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.bfs
+      loss_name: "Subgraph PBL [bfs]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.random_walk
+      loss_name: "Subgraph PBL [random_walk]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.forest_fire
+      loss_name: "Subgraph PBL [forest_fire]"
+      keyword: finetune_subgraph_pbl
+    - name: recycle_loss
+      recycled_parameter: per_strategy_pbl_loss.snowball
+      loss_name: "Subgraph PBL [snowball]"
+      keyword: finetune_subgraph_pbl
