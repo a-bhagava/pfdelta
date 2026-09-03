@@ -31,7 +31,7 @@
 #      as model_path/output_dir are both given explicitly too.
 #   3. Default place to write consistency_transfer_eval.json/.png --
 #      override with output_dir.
-source_run: runs/canos_task_3_1_joint_train_0828_tinysg/canos_sgband_5_w_sg_cons1e-2_w_sg_pbl10_task_3_1_joint_0828_tinysg_6_260829_014138
+source_run: runs/canos_case500_hyperparam_later_stop/canos_k_steps15_hd256_lr1e-3_5_260824_183432
 # Uncomment to bypass source_run's config.yaml for the architecture
 # entirely (e.g. if you only have a bare model_path, or its config.yaml
 # is missing/wrong) -- fill in whichever of these source_run's own
