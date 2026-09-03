@@ -62,7 +62,7 @@ dataset:
     root_dir: /orcd/pool/005/donti_shared/pfdelta_data
     split: train
     task: 1.3
-    branch_perturbation_sigma: 0.05
+    branch_perturbation_sigma: _manual_list(0, 0.03, 0.10, 0.30 | 0, 0.03, 0.10, 0.30)
   - add_bus_type: true
     case_name: case14
     model: CANOS
@@ -101,9 +101,9 @@ dataset:
 functional:
   checkpoint: True
   run_location: canos_task_3_1_joint_train_branch_perturbation
-  run_name: canos_sgband_%min_size_w_sg_cons%w_sg_cons_w_sg_pbl%w_sg_pbl_mix%mix_task_sgps_%subgraphs_per_sample_3_1_joint_bp0.05
+  run_name: canos_bp_%branch_perturbation_sigma_spsg_%subgraphs_per_sample_seed_%seed
   is_debug: false
-  seed: 11
+  seed: _manual_list(0, 1, 2 | 0, 1, 2)
   cpu: false
   trainer_name: subgraph_finetune_trainer
   # val_loss's subproblem_consistency entry (below) actually runs on every
@@ -187,7 +187,7 @@ optim:
         # other. Proportions don't need to sum to 1 -- pick_sampling_
         # strategy normalizes automatically, so plain relative weights
         # (1 vs 0) are enough to express "on"/"off".
-        mix: _connected_list(mix -- pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+        mix: _connected_list(mix -- even_mix | even_mix)
         inputs:
           # min_size/max_size vary together (paired, not cross-producted) across
           # three size bands -- two tight ones (case30, case118), plus a "wide"
@@ -232,15 +232,15 @@ optim:
           # not fractions -- see the comment above.
           sampling_strategies:
             bfs:
-              proportion: _connected_list(mix -- 1, 1, 0, 0, 0, 0, 1, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+              proportion: _connected_list(mix -- 1 | even_mix)
             random_walk:
-              proportion: _connected_list(mix -- 0, 1, 1, 1, 0, 0, 0, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+              proportion: _connected_list(mix -- 1 | even_mix)
               restart_prob: 0.15
             forest_fire:
-              proportion: _connected_list(mix -- 0, 1, 1, 0, 1, 0, 1, 0, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+              proportion: _connected_list(mix -- 1 | even_mix)
               p: 0.35
             snowball:
-              proportion: _connected_list(mix -- 0, 1, 1, 0, 0, 1, 1, 1, 0 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+              proportion: _connected_list(mix -- 1 | even_mix)
               degree_weight_power: 1.0
           # To use a precomputed pool instead of live sampling (see
           # core.utils.create_subproblem's POOLED sampling section /
@@ -359,9 +359,6 @@ optim:
       keyword: finetune_subgraph_pbl
   val_params:
     batch_size: 128
-    # Re-enabled (commented out in the finetune config, since an 80-epoch
-    # finetune from an already-good checkpoint doesn't need it) -- a
-    # 200-epoch from-scratch run does, matching canos_task_1_3.yaml.
     report_every: 1
     val_loss:
     - model: CANOS
@@ -389,15 +386,15 @@ optim:
       # own nested proportion fields are safe.
       sampling_strategies:
         bfs:
-          proportion: _connected_list(mix -- 1, 1, 0, 0, 0, 0, 1, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+          proportion: _connected_list(mix -- 1 | even_mix)
         random_walk:
-          proportion: _connected_list(mix -- 0, 1, 1, 1, 0, 0, 0, 1, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+          proportion: _connected_list(mix -- 1 | even_mix)
           restart_prob: 0.15
         forest_fire:
-          proportion: _connected_list(mix -- 0, 1, 1, 0, 1, 0, 1, 0, 1 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+          proportion: _connected_list(mix -- 1 | even_mix)
           p: 0.35
         snowball:
-          proportion: _connected_list(mix -- 0, 1, 1, 0, 0, 1, 1, 1, 0 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
+          proportion: _connected_list(mix -- 1 | even_mix)
           degree_weight_power: 1.0
       # Same pool_path opt-in as train_loss[0]'s own subproblem_consistency
       # entry above (see the comment there) -- same ONE file, same literal
