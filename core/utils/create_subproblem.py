@@ -44,14 +44,35 @@ def _timed(stats: Optional[dict], key: str):
     spent in the `with` block under `stats[key]` (summed across repeated
     calls, e.g. once per training step) -- used for opt-in profiling of
     where subproblem-construction time actually goes. See
-    SubgraphFinetuneTrainer for how these get reset/printed per epoch."""
+    SubgraphFinetuneTrainer for how these get reset/printed per epoch.
+
+    Syncs (`torch.cuda.synchronize()`) both before starting AND before
+    stopping the clock when CUDA is available -- CUDA ops are dispatched
+    asynchronously, so a plain `time.perf_counter()` around a block of pure
+    GPU work only measures how long the CPU took to QUEUE it, not how long
+    the GPU actually took to run it; whichever LATER block happens to be
+    the first to force a sync (e.g. a `.item()` call) then silently
+    "absorbs" every earlier block's unfinished GPU work into its own
+    measured time. E.g. `first_forward_pass` (pure GPU dispatch, no syncing
+    op inside it) reporting a suspiciously small number while the very next
+    block reports a suspiciously large one is this exact symptom -- fixed
+    by draining the queue at both ends of each timed block, so each one's
+    number reflects only its own work. Real (non-profiled) training is
+    unaffected either way (`stats is None` short-circuits before either
+    sync); this always runs (not opt-in) whenever profiling itself is on,
+    trading some profiling-run wall-clock time for numbers that are
+    actually trustworthy every time, not just on request."""
     if stats is None:
         yield
         return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     start = time.perf_counter()
     try:
         yield
     finally:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         stats[key] = stats.get(key, 0.0) + (time.perf_counter() - start)
 
 
@@ -607,6 +628,542 @@ def sample_bus_subset_snowball(
         frontier = next_frontier
 
     return torch.tensor(sorted(kept), dtype=torch.long)
+
+
+#############################################################################
+#   BATCHED (vectorized) sampling -- draws every subgraph in a call to
+#   build_subproblem_batch AT ONCE instead of looping sample_bus_subset*
+#   over samples/draws in Python. Only usable in "base mode" (see
+#   build_subproblem_batch) -- every draw sharing one case-local adjacency
+#   is exactly what lets D = num_samples * subgraphs_per_sample independent
+#   traversals run as D-wide vectorized rounds instead of D Python-level
+#   calls. The per-draw functions above (sample_bus_subset and friends)
+#   stay as the correctness reference and the fallback (irregular-batch /
+#   no-cache) path's implementation -- this section is purely a
+#   performance-motivated alternate implementation of the SAME sampling
+#   semantics, not a replacement for them.
+#
+#   Important: this is NOT a bit-for-bit reproduction of the sequential
+#   per-draw functions' exact random draws for a given seed -- vectorizing
+#   necessarily changes how the shared RNG stream gets consumed (per-round-
+#   across-all-draws instead of per-node-within-one-draw-at-a-time), so
+#   re-running an old seed will sample DIFFERENT (but equally valid)
+#   subgraphs than before. What's preserved is the DISTRIBUTIONAL contract
+#   each function's own docstring describes: connectivity, size bounds,
+#   exclusion respect, and each strategy's own qualitative shape (BFS's
+#   uniform shell growth, snowball's degree-inverse bias, forest fire's
+#   ability to die out early, random walk's local/revisiting exploration).
+#
+#   Entirely CPU tensor ops throughout (never touches whatever device
+#   `data`/`output_dict` live on) -- same design intent as the sequential
+#   functions (adjacency is a plain Python list of lists, `generator` is a
+#   CPU torch.Generator), avoiding GPU dispatch overhead for what's
+#   fundamentally small, cheap-per-element work. build_subproblem_batch's
+#   caller (_build_subproblem_vectorized) already moves the resulting
+#   `bus_subset_list` to the right device itself, same as it always did
+#   for the sequential functions' own CPU-tensor outputs.
+#############################################################################
+
+def _build_padded_adjacency(adjacency: list) -> tuple:
+    """
+    Dense `[N, max_degree]` neighbor table (+ a same-shape validity mask)
+    from a plain adjacency list -- lets a batched traversal gather many
+    nodes' neighbor rows via one tensor index instead of a per-node Python
+    list lookup. Short rows are right-padded with -1 (marked invalid in
+    `valid_mask`, never a real node id).
+
+    Cheap to rebuild -- only actually called when the base topology itself
+    changes (see `update_base_topology_cache`'s own convergence guarantee),
+    cached alongside `base_adjacency`/`degrees` in the same `case_cache`
+    dict with the same "rebuild only when the underlying adjacency object
+    changed" lifecycle (see `draw_subgraphs_batched`).
+
+    Returns
+    -------
+    neighbor_table, valid_mask : torch.Tensor
+        Both `[len(adjacency), max_degree]`, CPU, `neighbor_table` int64
+        (-1 padded), `valid_mask` bool.
+    """
+    num_nodes = len(adjacency)
+    max_deg = max((len(n) for n in adjacency), default=0)
+    max_deg = max(max_deg, 1)  # keep at least width 1 even for a totally isolated case
+    neighbor_table = torch.full((num_nodes, max_deg), -1, dtype=torch.long)
+    for i, neighbors in enumerate(adjacency):
+        if neighbors:
+            neighbor_table[i, : len(neighbors)] = torch.tensor(neighbors, dtype=torch.long)
+    valid_mask = neighbor_table >= 0
+    return neighbor_table, valid_mask
+
+
+def _build_exclusion_keys(per_sample_missing: list, num_nodes_per_case: int) -> Optional[torch.Tensor]:
+    """
+    Flat, encoded set of directed `(sample_id, i, j)` edge keys to skip
+    during batched traversal, built from `missing_edges_per_sample`'s
+    output and symmetrized (both directions) -- the batched equivalent of
+    the per-sample `excluded_neighbors` dict the sequential strategies
+    build (see `build_subproblem_batch`). Encoded as a single int64
+    `sample_id * N*N + i*N + j` so membership is one `torch.isin` call
+    instead of a Python dict lookup per candidate.
+
+    Returns None (not an empty tensor) when there's nothing to exclude
+    anywhere in this batch -- the common case once the base topology has
+    converged (most samples carry zero missing edges each batch) -- so
+    callers can skip the `isin` check entirely rather than pay for a
+    guaranteed-empty-result comparison every round.
+    """
+    triples = []
+    for k, missing in enumerate(per_sample_missing):
+        base = k * num_nodes_per_case * num_nodes_per_case
+        for i, j in missing:
+            triples.append(base + i * num_nodes_per_case + j)
+            triples.append(base + j * num_nodes_per_case + i)
+    if not triples:
+        return None
+    return torch.tensor(triples, dtype=torch.long)
+
+
+def _kept_matrix_to_list(kept: torch.Tensor, bus_offset_per_draw: torch.Tensor) -> list:
+    """
+    `[D, N]` bool -> list of `D` sorted 1-D LongTensors of GLOBAL bus
+    indices -- vectorized, no per-draw Python loop. `nonzero()` already
+    returns `(draw, local)` pairs in row-major order (ascending draw, then
+    ascending local index within a draw), and adding each draw's own
+    constant `bus_offset` preserves that ascending order -- so splitting by
+    each draw's own count directly reproduces the same "sorted, per-draw"
+    convention `sample_bus_subset` and friends return.
+    """
+    draw_idx, local_idx = kept.nonzero(as_tuple=True)
+    global_idx = local_idx + bus_offset_per_draw[draw_idx]
+    counts = kept.sum(dim=1).tolist()
+    return list(torch.split(global_idx, counts))
+
+
+def _batched_frontier_growth(
+    neighbor_table: torch.Tensor,
+    valid_mask: torch.Tensor,
+    seed_local: torch.Tensor,
+    sample_of_draw: torch.Tensor,
+    target_size: torch.Tensor,
+    num_nodes_per_case: int,
+    generator: Optional[torch.Generator] = None,
+    degree_weight: Optional[torch.Tensor] = None,
+    forest_fire_p: Optional[float] = None,
+    exclusion_keys: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Batched equivalent of `sample_bus_subset` (plain BFS), `sample_bus_
+    subset_snowball` (pass `degree_weight`), and `sample_bus_subset_
+    forest_fire` (pass `forest_fire_p`) -- all three share the same
+    "shell-by-shell" growth structure (grow the whole frontier's unvisited
+    neighbors each round, stop once `target_size` is hit or the frontier
+    dies out), differing only in how a round's candidates get ordered/
+    filtered before the shared budget cutoff. Grows all `D = seed_local.
+    numel()` independent subsets AT ONCE, one round at a time, instead of
+    looping over draws in Python -- each round is fully vectorized: gather
+    every active draw's frontier nodes' neighbor rows together, assign each
+    candidate edge a random priority (uniform for BFS/forest-fire, or the
+    same Efraimidis-Spirakis degree-inverse key `_weighted_shuffle` uses
+    for snowball), resolve same-round duplicate proposals (two frontier
+    nodes reaching the same unvisited candidate) by keeping the higher-
+    priority one, then keep only the top `remaining_budget` proposals per
+    draw.
+
+    Parameters
+    ----------
+    neighbor_table, valid_mask : torch.Tensor
+        `[num_nodes_per_case, max_degree]` -- see `_build_padded_adjacency`.
+    seed_local, sample_of_draw, target_size : torch.Tensor
+        `[D]` each -- this draw's own case-local seed bus, which of the
+        batch's original samples it belongs to (for `exclusion_keys`
+        lookups), and its own target subset size.
+    degree_weight : torch.Tensor, optional
+        `[num_nodes_per_case]`, already `1/degree**degree_weight_power` --
+        gives snowball's biased candidate ordering. None (default) gives
+        plain BFS/forest-fire's uniform ordering.
+    forest_fire_p : float, optional
+        Forward-burning probability. None (default) skips the per-source
+        burn-count cap entirely (BFS/snowball: every reachable candidate
+        competes for the shared budget). Given, each SOURCE node's own
+        candidates are first capped to a `Geometric(1-p)`-distributed count
+        (closed-form equivalent of `sample_bus_subset_forest_fire`'s
+        `while burn_count < len(candidates) and rng.random() < p` loop)
+        before the shared cross-source dedup/budget steps run.
+    exclusion_keys : torch.Tensor, optional
+        See `_build_exclusion_keys`. None if nothing to exclude anywhere in
+        this batch.
+
+    Returns
+    -------
+    torch.Tensor
+        `[D, num_nodes_per_case]` bool -- `kept[d, n]` iff local node `n`
+        is in draw `d`'s sampled subset.
+    """
+    device = neighbor_table.device
+    D = seed_local.numel()
+    N = num_nodes_per_case
+    max_deg = neighbor_table.shape[1]
+    idx = torch.arange(D, device=device)
+
+    kept = torch.zeros((D, N), dtype=torch.bool, device=device)
+    kept[idx, seed_local] = True
+    kept_count = torch.ones(D, dtype=torch.long, device=device)
+    frontier = torch.zeros((D, N), dtype=torch.bool, device=device)
+    frontier[idx, seed_local] = True
+
+    # Bounded by N -- no shell-based traversal can need more than N-1
+    # rounds to reach every node of an N-node component -- a safety cap,
+    # not something normally reached (draws stop naturally once every one
+    # has either hit target_size or run out of frontier).
+    for _ in range(N):
+        active = (kept_count < target_size) & frontier.any(dim=1)
+        if not bool(active.any()):
+            break
+        draw_idx, src_local = frontier.nonzero(as_tuple=True)
+        row_active = active[draw_idx]
+        draw_idx, src_local = draw_idx[row_active], src_local[row_active]
+        if draw_idx.numel() == 0:
+            break
+
+        cand_rows = neighbor_table[src_local]  # [M, max_deg]
+        cand_valid = valid_mask[src_local].clone()
+
+        # Random priority per (source, candidate-slot): plain U(0,1) for
+        # BFS/forest-fire, or the same "u ** (1/weight)" A-Res key
+        # `_weighted_shuffle` uses for snowball's degree-inverse bias.
+        u = torch.rand((cand_rows.shape[0], max_deg), generator=generator).clamp(1e-6, 1 - 1e-6)
+        if degree_weight is not None:
+            # Cast to u's own dtype (float32) -- degree_weight is commonly
+            # float64 (built from a plain Python list of degrees), and
+            # float32 ** float64 promotes to float64, which would then
+            # make `priority` a different dtype than the plain-uniform
+            # branch below (and than `best` further down), breaking
+            # scatter_reduce_'s dtype match requirement.
+            w = degree_weight[cand_rows.clamp(min=0)].clamp(min=1e-6).to(u.dtype)
+            priority = torch.where(cand_valid, u.pow(1.0 / w), torch.zeros_like(u))
+        else:
+            priority = torch.where(cand_valid, u, torch.zeros_like(u))
+
+        if forest_fire_p is not None:
+            row_deg = cand_valid.sum(dim=1)
+            p = float(forest_fire_p)
+            if p <= 0.0:
+                burn_count = torch.zeros_like(row_deg)
+            elif p >= 1.0:
+                burn_count = row_deg.clone()
+            else:
+                geo_u = torch.rand(cand_rows.shape[0], generator=generator).clamp(1e-6, 1 - 1e-6)
+                burn_count = torch.floor(torch.log(geo_u) / float(torch.log(torch.tensor(p)))).long()
+                burn_count = torch.minimum(burn_count.clamp(min=0), row_deg)
+            # 0-indexed priority rank within each row (double-argsort
+            # trick) -- keep only this row's own top `burn_count`.
+            rank = torch.argsort(torch.argsort(-priority, dim=1), dim=1)
+            cand_valid = cand_valid & (rank < burn_count.unsqueeze(1))
+            priority = torch.where(cand_valid, priority, torch.zeros_like(priority))
+
+        already_kept = kept[draw_idx.unsqueeze(1).expand(-1, max_deg), cand_rows.clamp(min=0)]
+        alive = cand_valid & ~already_kept
+
+        prop_draw = draw_idx.repeat_interleave(max_deg)
+        prop_cand = cand_rows.reshape(-1)
+        prop_priority = priority.reshape(-1)
+        prop_alive = alive.reshape(-1)
+
+        if exclusion_keys is not None:
+            prop_sample = sample_of_draw[prop_draw]
+            prop_src = src_local.repeat_interleave(max_deg)
+            edge_key = prop_sample * (N * N) + prop_src * N + prop_cand.clamp(min=0)
+            prop_alive = prop_alive & ~torch.isin(edge_key, exclusion_keys)
+
+        prop_draw = prop_draw[prop_alive]
+        prop_cand = prop_cand[prop_alive]
+        prop_priority = prop_priority[prop_alive]
+        if prop_draw.numel() == 0:
+            frontier = torch.zeros((D, N), dtype=torch.bool, device=device)
+            continue
+
+        # Dedup same-round duplicate proposals for the same (draw,
+        # candidate) pair (e.g. two frontier nodes both reaching the same
+        # unvisited neighbor this round) -- keep only the higher-priority
+        # one, via a grouped scatter-max (same style as
+        # _build_subproblem_vectorized's segmented slack-promotion reduce).
+        dedup_key = prop_draw * N + prop_cand
+        best = torch.full((D * N,), -1.0, device=device)
+        best.scatter_reduce_(0, dedup_key, prop_priority, reduce="amax", include_self=True)
+        is_best = prop_priority >= best[dedup_key]
+        prop_draw, prop_cand, prop_priority = prop_draw[is_best], prop_cand[is_best], prop_priority[is_best]
+        dedup_key = dedup_key[is_best]
+        # Exact-tie safety net (two surviving proposals landing on the
+        # identical (draw, candidate) key AND identical priority) --
+        # essentially never happens with continuous random priorities, but
+        # drop duplicates defensively (keep the first) rather than risk
+        # double-counting one candidate against the size budget below.
+        dedup_key_sorted, order = torch.sort(dedup_key)
+        first_of_group = torch.ones_like(dedup_key_sorted, dtype=torch.bool)
+        first_of_group[1:] = dedup_key_sorted[1:] != dedup_key_sorted[:-1]
+        order = order[first_of_group]
+        prop_draw, prop_cand, prop_priority = prop_draw[order], prop_cand[order], prop_priority[order]
+
+        # Global per-draw remaining-budget cutoff. Fast path first: with
+        # small target sizes (this augmentation typically cuts subgraphs
+        # of a handful of buses), most rounds -- especially early ones --
+        # propose FEWER deduped candidates per draw than that draw's own
+        # remaining budget, so no truncation is actually needed at all;
+        # skip the lexsort/grouping machinery below entirely in that case
+        # (just accept every surviving proposal) rather than pay its
+        # overhead on every round regardless of whether it does anything.
+        remaining = (target_size - kept_count).clamp(min=0)
+        proposal_count = torch.zeros(D, dtype=torch.long, device=device)
+        proposal_count.scatter_add_(0, prop_draw, torch.ones_like(prop_draw))
+        if bool((proposal_count <= remaining).all()):
+            accepted_draw = prop_draw
+            accepted_cand = prop_cand
+        else:
+            # Single lexicographic sort key (draw ascending, priority
+            # descending) via one combined float64 (safe since priority in
+            # (0,1) never spills into the next draw's integer slot), then
+            # each draw's own run is already priority-sorted -- "rank
+            # within group" (position minus the group's own start offset)
+            # directly gives who's inside the top `remaining_budget[draw]`.
+            combo = prop_draw.to(torch.float64) + (1.0 - prop_priority.to(torch.float64))
+            order = torch.argsort(combo)
+            d_sorted = prop_draw[order]
+            _, counts = torch.unique_consecutive(d_sorted, return_counts=True)
+            starts = torch.cumsum(counts, 0) - counts
+            group_start_per_pos = torch.repeat_interleave(starts, counts)
+            rank_in_group = torch.arange(d_sorted.numel(), device=device) - group_start_per_pos
+            accept = rank_in_group < remaining[d_sorted]
+            accepted_draw = d_sorted[accept]
+            accepted_cand = prop_cand[order][accept]
+
+        next_frontier = torch.zeros((D, N), dtype=torch.bool, device=device)
+        if accepted_draw.numel() > 0:
+            next_frontier[accepted_draw, accepted_cand] = True
+            kept[accepted_draw, accepted_cand] = True
+            kept_count.scatter_add_(0, accepted_draw, torch.ones_like(accepted_draw))
+        frontier = next_frontier
+
+    return kept
+
+
+def _batched_random_walk(
+    neighbor_table: torch.Tensor,
+    valid_mask: torch.Tensor,
+    seed_local: torch.Tensor,
+    sample_of_draw: torch.Tensor,
+    target_size: torch.Tensor,
+    num_nodes_per_case: int,
+    generator: Optional[torch.Generator] = None,
+    restart_prob: float = 0.15,
+    max_steps_factor: int = 50,
+    exclusion_keys: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Batched equivalent of `sample_bus_subset_random_walk` -- runs all
+    `D = seed_local.numel()` independent random-with-restart walks in
+    lockstep, one step at a time. A single walk's own trace is inherently
+    sequential (where it goes next depends on where it just was), but the D
+    walks are completely independent of each other, so each step is one
+    vectorized round across all of them instead of D separate Python loops
+    of up to `max_steps_factor * target_size` iterations each.
+
+    Same contract as the sequential version: every kept node reached by a
+    real edge traversal from `seed_local` (so always connected), revisits
+    are allowed and don't grow the subset further, growth stops once
+    `target_size` is hit or this draw's own step budget runs out (a
+    smaller-than-requested result in that case, not a failure).
+
+    Parameters mirror `_batched_frontier_growth`'s shared ones, plus
+    `restart_prob`/`max_steps_factor` -- see `sample_bus_subset_random_
+    walk`'s own docstring for what they control.
+    """
+    device = neighbor_table.device
+    D = seed_local.numel()
+    N = num_nodes_per_case
+    max_deg = neighbor_table.shape[1]
+    idx = torch.arange(D, device=device)
+
+    kept = torch.zeros((D, N), dtype=torch.bool, device=device)
+    kept[idx, seed_local] = True
+    kept_count = torch.ones(D, dtype=torch.long, device=device)
+    current = seed_local.clone()
+    steps_left = (target_size * max_steps_factor).clamp(min=100)
+
+    max_rounds = int(steps_left.max().item()) if steps_left.numel() > 0 else 0
+    for _ in range(max_rounds):
+        active = (kept_count < target_size) & (steps_left > 0)
+        if not bool(active.any()):
+            break
+        steps_left = steps_left - active.long()
+
+        restart = (torch.rand(D, generator=generator) < restart_prob) & active
+
+        cand_rows = neighbor_table[current]  # [D, max_deg]
+        cand_valid = valid_mask[current].clone()
+        if exclusion_keys is not None:
+            edge_key = (
+                sample_of_draw.unsqueeze(1) * (N * N)
+                + current.unsqueeze(1) * N
+                + cand_rows.clamp(min=0)
+            )
+            cand_valid = cand_valid & ~torch.isin(edge_key, exclusion_keys)
+        u = torch.where(
+            cand_valid,
+            torch.rand((D, max_deg), generator=generator),
+            torch.full((D, max_deg), -1.0),
+        )
+        has_candidate = cand_valid.any(dim=1)
+        choice_col = u.argmax(dim=1)
+        next_local = cand_rows[idx, choice_col]
+
+        move = active & ~restart & has_candidate
+        # Dead end (isolated/all-excluded) or an explicit restart draw --
+        # both reseed to seed_bus, same as the sequential version.
+        reseed = active & (restart | (~has_candidate & ~restart))
+        new_current = torch.where(move, next_local, current)
+        new_current = torch.where(reseed, seed_local, new_current)
+        current = torch.where(active, new_current, current)
+
+        active_idx = idx[active]
+        active_current = current[active]
+        newly = ~kept[active_idx, active_current]
+        kept[active_idx, active_current] = True
+        kept_count[active_idx] += newly.long()
+
+    return kept
+
+
+def draw_subgraphs_batched(
+    base_adjacency: list,
+    case_cache: dict,
+    ptr_list: list,
+    num_nodes_per_case: int,
+    min_size,
+    max_size,
+    subgraphs_per_sample: int,
+    generator: Optional[torch.Generator],
+    sampling_strategies: Optional[dict],
+    per_sample_missing: list,
+) -> tuple:
+    """
+    Batched replacement for `build_subproblem_batch`'s own per-sample,
+    per-draw Python loop over `SAMPLING_STRATEGIES` -- draws ALL
+    `D = (len(ptr_list) - 1) * subgraphs_per_sample` independent subgraphs
+    at once instead of looping. Only usable in "base mode" (every sample
+    sharing one case-local `base_adjacency`) -- see `build_subproblem_
+    batch`'s own adjacency-mode selection.
+
+    Draws mixing strategies (via `pick_sampling_strategy`'s weighted
+    choice) are handled by grouping draws by their assigned strategy first
+    (one vectorized call per strategy actually present this batch, over
+    just that strategy's own draws), then reassembling results back into
+    original sample-major, draw-order position -- so the returned lists
+    line up with `build_subproblem_batch`'s existing per-draw Python-loop
+    convention exactly, and `_build_subproblem_vectorized` downstream needs
+    no changes at all.
+
+    See `_batched_frontier_growth`/`_batched_random_walk` for what
+    "batched" means here and this module's own note (just above
+    `_build_padded_adjacency`) on the distributional- (not bit-)
+    equivalence contract with `SAMPLING_STRATEGIES`'s sequential functions.
+
+    Returns
+    -------
+    bus_subset_list : list[torch.Tensor]
+        Length `D`, sample-major then draw-order -- each a sorted
+        LongTensor of GLOBAL bus indices, same convention as
+        `build_subproblem_batch`'s own per-draw loop.
+    strategy_per_subgraph : list[str] or None
+        Same convention as `build_subproblem_batch`'s own return value --
+        None when `sampling_strategies` is None.
+    """
+    K = len(ptr_list) - 1
+    D = K * subgraphs_per_sample
+    if D == 0:
+        return [], ([] if sampling_strategies is not None else None)
+
+    N = num_nodes_per_case
+    lo_per_sample = torch.tensor(ptr_list[:-1], dtype=torch.long)
+    sample_of_draw = torch.arange(K, dtype=torch.long).repeat_interleave(subgraphs_per_sample)
+    bus_offset_per_draw = lo_per_sample[sample_of_draw]
+
+    lo_size, hi_size = int(min_size), int(max_size)
+    lo_size, hi_size = min(lo_size, hi_size), max(lo_size, hi_size)
+    target_size = torch.randint(lo_size, hi_size + 1, (D,), generator=generator)
+    seed_local = torch.randint(0, N, (D,), generator=generator)
+
+    # Cached alongside base_adjacency/degrees in the SAME case_cache dict,
+    # rebuilt only when base_adjacency itself was rebuilt this call (the
+    # `is` check is deliberate -- update_base_topology_cache only replaces
+    # base_cache["base_adjacency"] with a NEW list object when the topology
+    # actually changed, never mutates the old one in place).
+    if case_cache.get("_padded_adjacency_for") is not base_adjacency:
+        case_cache["_padded_adjacency"] = _build_padded_adjacency(base_adjacency)
+        case_cache["_padded_adjacency_for"] = base_adjacency
+    neighbor_table, valid_mask = case_cache["_padded_adjacency"]
+
+    exclusion_keys = _build_exclusion_keys(per_sample_missing, N)
+
+    if sampling_strategies is None:
+        kept = _batched_frontier_growth(
+            neighbor_table, valid_mask, seed_local, sample_of_draw, target_size,
+            N, generator=generator, exclusion_keys=exclusion_keys,
+        )
+        return _kept_matrix_to_list(kept, bus_offset_per_draw), None
+
+    names = list(sampling_strategies.keys())
+    weights = torch.tensor(
+        [float(sampling_strategies[n].get("proportion", 1.0)) for n in names], dtype=torch.float64
+    )
+    total = weights.sum()
+    assert total > 0, "sampling_strategies proportions must sum to something positive"
+    cum = torch.cumsum(weights, 0) / total
+    r = torch.rand(D, generator=generator).to(torch.float64)
+    strategy_idx = torch.searchsorted(cum, r, right=False).clamp(max=len(names) - 1)
+
+    bus_subset_list = [None] * D
+    strategy_per_subgraph = [None] * D
+    degrees_tensor = None
+
+    for s_idx, name in enumerate(names):
+        group_positions = (strategy_idx == s_idx).nonzero(as_tuple=True)[0]
+        if group_positions.numel() == 0:
+            continue
+        cfg = {k: v for k, v in sampling_strategies[name].items() if k != "proportion"}
+        g_seed = seed_local[group_positions]
+        g_sample = sample_of_draw[group_positions]
+        g_target = target_size[group_positions]
+        g_offset = bus_offset_per_draw[group_positions]
+
+        if name == "random_walk":
+            kept = _batched_random_walk(
+                neighbor_table, valid_mask, g_seed, g_sample, g_target, N, generator=generator,
+                restart_prob=float(cfg.get("restart_prob", 0.15)),
+                max_steps_factor=int(cfg.get("max_steps_factor", 50)),
+                exclusion_keys=exclusion_keys,
+            )
+        else:
+            degree_weight = None
+            forest_fire_p = None
+            if name == "snowball":
+                power = float(cfg.get("degree_weight_power", 1.0))
+                if power != 0:
+                    if degrees_tensor is None:
+                        degrees_tensor = torch.tensor(case_cache["degrees"], dtype=torch.float64)
+                    degree_weight = 1.0 / degrees_tensor.clamp(min=1).pow(power)
+            elif name == "forest_fire":
+                forest_fire_p = float(cfg.get("p", 0.3))
+            kept = _batched_frontier_growth(
+                neighbor_table, valid_mask, g_seed, g_sample, g_target, N, generator=generator,
+                degree_weight=degree_weight, forest_fire_p=forest_fire_p,
+                exclusion_keys=exclusion_keys,
+            )
+
+        group_subsets = _kept_matrix_to_list(kept, g_offset)
+        for pos_in_group, draw_pos in enumerate(group_positions.tolist()):
+            bus_subset_list[draw_pos] = group_subsets[pos_in_group]
+            strategy_per_subgraph[draw_pos] = name
+
+    return bus_subset_list, strategy_per_subgraph
 
 
 # Registry of sampling strategies, keyed by the name used in a
@@ -1367,67 +1924,66 @@ def build_subproblem_batch(
     # here -- see _build_subproblem_vectorized's docstring.
     with _timed(stats, "sample_bus_subset"):
         ptr_list = ptr.tolist()
-        # Only needed for strategy="snowball" -- cached alongside the base
-        # adjacency when available; computed once here (not per-draw) in
-        # the fallback path, where there's no persistent cache to hang it
-        # off of.
-        degrees = None
-        if sampling_strategies is not None:
-            degrees = (
-                case_cache.get("degrees") if use_base_mode
-                else [len(n) for n in adjacency]
+        if use_base_mode:
+            # Vectorized: draws every (sample, subgraphs_per_sample) subset
+            # in this batch at once instead of looping sample_bus_subset*
+            # in Python -- see draw_subgraphs_batched's own docstring for
+            # why "base mode" (one shared case-local adjacency) is what
+            # makes this possible, and this module's note on its
+            # distributional- (not bit-) equivalence to the per-draw
+            # functions below.
+            bus_subset_list, strategy_per_subgraph = draw_subgraphs_batched(
+                base_adjacency, case_cache, ptr_list, num_nodes_per_case,
+                min_size, max_size, subgraphs_per_sample, generator,
+                sampling_strategies, per_sample_missing,
             )
-        bus_subset_list = []
-        strategy_per_subgraph = [] if sampling_strategies is not None else None
-        for k in range(len(ptr_list) - 1):
-            lo, hi = ptr_list[k], ptr_list[k + 1]
-            if hi <= lo:
-                continue
-            if use_base_mode:
-                # This sample's own missing-edge patch against the shared
-                # base topology (see missing_edges_per_sample) -- symmetric
-                # since undirected, and typically 0-2 entries (N-1/N-2).
-                excluded: dict = {}
-                for i, j in per_sample_missing[k]:
-                    excluded.setdefault(i, set()).add(j)
-                    excluded.setdefault(j, set()).add(i)
-                sample_kwargs = dict(
-                    adjacency=base_adjacency, bus_offset=lo, excluded_neighbors=excluded
-                )
-            else:
+        else:
+            # Irregular batch (different bus counts per sample) or no
+            # cache requested at all -- no shared case-local adjacency to
+            # batch draws against, so fall back to the original per-draw
+            # Python loop (rare path; see the adjacency-mode selection
+            # above).
+            degrees = [len(n) for n in adjacency] if sampling_strategies is not None else None
+            bus_subset_list = []
+            strategy_per_subgraph = [] if sampling_strategies is not None else None
+            for k in range(len(ptr_list) - 1):
+                lo, hi = ptr_list[k], ptr_list[k + 1]
+                if hi <= lo:
+                    continue
                 sample_kwargs = dict(adjacency=adjacency)
-            # subgraphs_per_sample independent draws per original sample --
-            # own seed bus, own sampling strategy (if sampling_strategies
-            # is given -- see this function's own docstring for why mixing
-            # per-draw, rather than pinning one strategy per batch, doesn't
-            # cost anything extra here), and own growth each time, so
-            # within one sample the draws aren't just copies of each other.
-            for _ in range(subgraphs_per_sample):
-                seed_bus = torch.randint(lo, hi, (1,), generator=generator).item()
-                if sampling_strategies is not None:
-                    strategy_name = pick_sampling_strategy(sampling_strategies, generator=generator)
-                    strategy_fn = SAMPLING_STRATEGIES[strategy_name]
-                    strategy_kwargs = {
-                        key: value
-                        for key, value in sampling_strategies[strategy_name].items()
-                        if key != "proportion"
-                    }
-                    if strategy_name == "snowball":
-                        strategy_kwargs.setdefault("degrees", degrees)
-                    strategy_per_subgraph.append(strategy_name)
-                else:
-                    strategy_fn = sample_bus_subset
-                    strategy_kwargs = {}
-                bus_subset_list.append(
-                    strategy_fn(
-                        seed_bus=seed_bus,
-                        min_size=min_size,
-                        max_size=max_size,
-                        generator=generator,
-                        **sample_kwargs,
-                        **strategy_kwargs,
+                # subgraphs_per_sample independent draws per original
+                # sample -- own seed bus, own sampling strategy (if
+                # sampling_strategies is given -- see this function's own
+                # docstring for why mixing per-draw, rather than pinning
+                # one strategy per batch, doesn't cost anything extra
+                # here), and own growth each time, so within one sample
+                # the draws aren't just copies of each other.
+                for _ in range(subgraphs_per_sample):
+                    seed_bus = torch.randint(lo, hi, (1,), generator=generator).item()
+                    if sampling_strategies is not None:
+                        strategy_name = pick_sampling_strategy(sampling_strategies, generator=generator)
+                        strategy_fn = SAMPLING_STRATEGIES[strategy_name]
+                        strategy_kwargs = {
+                            key: value
+                            for key, value in sampling_strategies[strategy_name].items()
+                            if key != "proportion"
+                        }
+                        if strategy_name == "snowball":
+                            strategy_kwargs.setdefault("degrees", degrees)
+                        strategy_per_subgraph.append(strategy_name)
+                    else:
+                        strategy_fn = sample_bus_subset
+                        strategy_kwargs = {}
+                    bus_subset_list.append(
+                        strategy_fn(
+                            seed_bus=seed_bus,
+                            min_size=min_size,
+                            max_size=max_size,
+                            generator=generator,
+                            **sample_kwargs,
+                            **strategy_kwargs,
+                        )
                     )
-                )
 
     # No separate "batch_from_data_list" stage anymore -- _build_subproblem_
     # vectorized now assembles the final batched sub_data directly, so that
