@@ -146,7 +146,21 @@ def update_base_topology_cache(
     batch_keys = _canonical_edge_keys(local_src, local_dst, num_nodes_per_case)
 
     base_keys = base_cache.get("base_keys")
-    if base_keys is None:
+    cached_num_nodes_per_case = base_cache.get("num_nodes_per_case")
+    if base_keys is None or cached_num_nodes_per_case != num_nodes_per_case:
+        # Either a genuinely fresh cache, or `base_cache` belongs to a
+        # DIFFERENT case (e.g. the same SubproblemConsistencyLoss instance,
+        # and so the same adjacency_cache dict, gets reused across every
+        # val dataset in one epoch's validation loop -- case14, case30,
+        # ... case500 -- each with its own bus count). `base_keys`' encoding
+        # (i*num_nodes_per_case+j, see _canonical_edge_keys) is only valid
+        # for the num_nodes_per_case it was built under, so a size change
+        # makes the OLD keys meaningless, not just stale -- merging them in
+        # via torch.isin below would silently decode into bus indices out
+        # of range for the new case (this is what used to crash
+        # _build_subproblem_vectorized's scatter_add_ with a CUDA
+        # out-of-bounds assert once consistency_val_indices started
+        # covering more than one case). Must discard and rebuild, not merge.
         new_keys = torch.unique(batch_keys)
         changed = True
     else:
@@ -1247,6 +1261,14 @@ def build_subproblem_batch(
         single case, contingency or not, since N-1/N-2 only removes
         branches, never buses. Falls back to a plain (uncached) full
         rebuild via `build_adjacency` otherwise, or if this is None.
+        Internally keyed by `num_nodes_per_case` (one sub-dict per distinct
+        case size) -- safe to pass the SAME dict across calls that see
+        DIFFERENT cases (e.g. one SubproblemConsistencyLoss instance's own
+        cache, reused across every val dataset in a validation loop), each
+        case gets its own independently-converging sub-cache rather than
+        corrupting a shared one (the base topology's canonical edge
+        encoding is only valid for the num_nodes_per_case it was built
+        under -- see update_base_topology_cache).
     subgraphs_per_sample : int, optional
         How many independent subgraphs to draw per original sample in
         `data` (default 1, matching the original single-subgraph-per-
@@ -1303,13 +1325,26 @@ def build_subproblem_batch(
         )
 
         if adjacency_cache is not None and uniform_case_size:
-            changed = update_base_topology_cache(edge_index, ptr, num_nodes_per_case, adjacency_cache)
+            # Keyed by num_nodes_per_case, not used flat -- the SAME
+            # adjacency_cache dict (e.g. one SubproblemConsistencyLoss
+            # instance's own, long-lived across every val dataset in a
+            # validation loop) gets called against DIFFERENT cases in
+            # sequence (case14, case30, ... case500), each with its own bus
+            # count. update_base_topology_cache's canonical edge encoding
+            # is only valid for one fixed num_nodes_per_case, so sharing a
+            # single flat cache across cases used to silently corrupt into
+            # out-of-range bus indices (see its own docstring/comment).
+            # Bus count is a reasonable per-case key since a single case's
+            # own contingency samples (N-1/N-2) only ever remove branches,
+            # never buses -- see PFDeltaDataset's `perturbation` param.
+            case_cache = adjacency_cache.setdefault(num_nodes_per_case, {})
+            changed = update_base_topology_cache(edge_index, ptr, num_nodes_per_case, case_cache)
             if changed:
                 _bump(stats, "adjacency_base_updated#count")
             per_sample_missing = missing_edges_per_sample(
-                edge_index, ptr, num_nodes_per_case, adjacency_cache
+                edge_index, ptr, num_nodes_per_case, case_cache
             )
-            base_adjacency = adjacency_cache["base_adjacency"]
+            base_adjacency = case_cache["base_adjacency"]
             use_base_mode = True
             _bump(stats, "adjacency_base_mode#count")
         else:
@@ -1339,7 +1374,7 @@ def build_subproblem_batch(
         degrees = None
         if sampling_strategies is not None:
             degrees = (
-                adjacency_cache.get("degrees") if use_base_mode
+                case_cache.get("degrees") if use_base_mode
                 else [len(n) for n in adjacency]
             )
         bus_subset_list = []

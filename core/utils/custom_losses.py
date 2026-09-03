@@ -358,7 +358,12 @@ class SubproblemConsistencyLoss:
         # cache docstrings) -- lets it track each sample's own small
         # contingency (N-1/N-2) deviation from a shared base topology
         # instead of rebuilding a whole adjacency list from scratch nearly
-        # every call.
+        # every call. Safe to reuse across DIFFERENT cases too -- e.g. this
+        # exact instance is called against every val dataset in a
+        # validation loop (case14, case30, ... case500) in sequence --
+        # build_subproblem_batch keys this dict per case (by bus count)
+        # internally, so each case converges its own independent sub-cache
+        # rather than corrupting a shared one.
         self._adjacency_cache = {}
         # Opt-in profiling: accumulates wall-clock seconds (summed across
         # repeated calls) under "build_subproblem_batch" (itself broken down
