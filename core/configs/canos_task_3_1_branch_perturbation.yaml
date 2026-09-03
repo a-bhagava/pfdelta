@@ -9,7 +9,7 @@ job_parameters:
   gres: gpu:h200:1
   requeue: __novalue__
   body: "source ~/.bashrc\nconda activate pfdelta2\nexec __launch__"
-  mem: 64G
+  mem: 80G
   output: canos_hyperparam_joint_branch_perturbation_%j.out
   signal: USR1@90
   time: "05:59:00"
@@ -144,7 +144,7 @@ optim:
     name: Adam
     weight_decay: 0.0
   train_params:
-    batch_size: 128
+    batch_size: 256
     epochs: 200
     train_loss:
     # Flat N-way combined_loss: total = 1.0*PBL + w2*consistency + w3*subgraph
