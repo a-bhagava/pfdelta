@@ -71,7 +71,17 @@ def discover_full_topology(dataset, num_scan_samples: int) -> tuple:
     num_buses)."""
     n = min(num_scan_samples, len(dataset))
     batch = Batch.from_data_list([dataset[i] for i in range(n)])
-    num_buses = dataset[0]["bus"].num_nodes
+    # Real (non-test) PFDeltaDataset samples don't always have "num_nodes"
+    # explicitly stored on the "bus" NodeStorage -- accessing it directly
+    # then raises AttributeError rather than inferring it, unlike
+    # Batch.from_data_list's own internal handling (which is why that call
+    # above works fine either way). Same fallback evaluate_consistency_
+    # transfer.py's own get_num_buses already uses.
+    sample0 = dataset[0]
+    if "num_nodes" in sample0["bus"]:
+        num_buses = int(sample0["bus"].num_nodes)
+    else:
+        num_buses = int(sample0["bus"].x.shape[0])
     edge_index = batch["bus", "branch", "bus"].edge_index
     ptr = batch["bus"].ptr
     base_cache: dict = {}
