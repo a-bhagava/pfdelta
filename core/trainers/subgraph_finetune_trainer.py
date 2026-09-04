@@ -180,10 +180,7 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         # happened once), not a value that means anything here.
         saved = {}
         for i, loss in enumerate(self.val_loss):
-            if isinstance(loss, SubproblemConsistencyLoss) or (
-                isinstance(loss, RecycleLoss)
-                and isinstance(loss.source, SubproblemConsistencyLoss)
-            ):
+            if self._reads_from_consistency(loss):
                 saved[i] = loss
                 self.val_loss[i] = _skip_consistency
         try:
@@ -191,6 +188,25 @@ class SubgraphFinetuneTrainer(GNNTrainer):
         finally:
             for i, loss in saved.items():
                 self.val_loss[i] = loss
+
+    def _reads_from_consistency(self, loss):
+        """True if `loss` is a SubproblemConsistencyLoss, or reads off one
+        (directly, or transitively through any depth of CombinedLoss
+        nesting -- e.g. a combined_loss val entry built entirely from
+        recycle_loss sub-components, like the one reconstructing train's
+        own weighted objective on val -- see canos_task_3_1_joint_train.
+        yaml's own "Training objective (val, reconstructed)" entry) --
+        used by calc_one_val_error's swap to correctly catch EVERY entry
+        that would otherwise read stale/leftover values on a val dataset
+        subproblem_consistency doesn't actually run on, not just top-level
+        ones."""
+        if isinstance(loss, SubproblemConsistencyLoss):
+            return True
+        if isinstance(loss, RecycleLoss):
+            return isinstance(loss.source, SubproblemConsistencyLoss)
+        if isinstance(loss, CombinedLoss):
+            return any(self._reads_from_consistency(instance) for _, _, instance in loss.components)
+        return False
 
     def _wire_subproblem_loss(self, loss):
         if isinstance(loss, SubproblemConsistencyLoss):

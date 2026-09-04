@@ -320,6 +320,17 @@ optim:
     # finetune from an already-good checkpoint doesn't need it) -- a
     # 200-epoch from-scratch run does, matching canos_task_1_3.yaml.
     report_every: 1
+    # Without these, checkpointing (base_trainer.interpret_val_performance)
+    # defaults to val dataset 0's FIRST-listed val_loss entry -- here
+    # that's case14's own "PBL Mean" (plain supervised power-flow error),
+    # NOT case500 and NOT the actual weighted objective train_loss[0]
+    # backpropagates. checkpoint_val_index: 4 = case500 (0-indexed into
+    # dataset.datasets[1:], same as val_num in calc_one_val_error);
+    # checkpoint_metric names the "Training objective (val, reconstructed)"
+    # entry added to val_loss below, which reconstructs train_loss[0]'s
+    # exact 1.0*PBL + w2*consistency + w3*subgraph-PBL combination.
+    checkpoint_val_index: 4
+    checkpoint_metric: "PBL+wConsistency+wSubgraphPBL"
     val_loss:
     - model: CANOS
       name: universal_power_balance
@@ -422,3 +433,37 @@ optim:
       recycled_parameter: per_strategy_pbl_loss.snowball
       loss_name: "Subgraph PBL [snowball]"
       keyword: finetune_subgraph_pbl
+    # Reconstructs the EXACT same weighted objective train_loss[0] itself
+    # backpropagates (1.0*PBL + w2*consistency + w3*subgraph-PBL), on
+    # every val dataset -- built entirely from recycle_loss sub-components
+    # reading the SAME already-computed values the logging entries above
+    # read (no extra forward pass, no second subproblem_consistency call).
+    # CombinedLoss.loss_name joins each component's own loss_name with
+    # "+", giving this entry the key "PBL+wConsistency+wSubgraphPBL" --
+    # what functional.checkpoint_metric above actually names. Same w2/w3
+    # as train_loss[0]'s own subproblem_consistency/recycle_loss weights,
+    # via the SAME consw/pblw connect keys, so they can never drift out of
+    # sync with what training is actually optimizing. On val datasets not
+    # in consistency_val_indices, SubgraphFinetuneTrainer.calc_one_val_
+    # error's swap (now recursive -- see _reads_from_consistency) catches
+    # this whole entry too, reporting NaN there instead of a stale value.
+    - name: combined_loss
+      losses:
+      - name: recycle_loss
+        weight: 1.0
+        inputs:
+          recycled_parameter: power_balance_mean
+          loss_name: "PBL"
+          keyword: finetune_supervised
+      - name: recycle_loss
+        weight: _connected_list(consw -- 0.01 | 0.01)
+        inputs:
+          recycled_parameter: loss
+          loss_name: "wConsistency"
+          keyword: finetune_consistency
+      - name: recycle_loss
+        weight: _connected_list(pblw -- 10 | 10)
+        inputs:
+          recycled_parameter: pbl_loss
+          loss_name: "wSubgraphPBL"
+          keyword: finetune_subgraph_pbl

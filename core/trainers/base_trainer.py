@@ -853,8 +853,29 @@ class BaseTrainer:
         This method is used to calculate the performance of the model over the
         validation sets. The default one is to use only the leading val error
         and average it over all validation datasets.
+
+        `checkpoint_val_index` (int) + `checkpoint_metric` (str), if BOTH
+        given in val_params, override that default entirely -- picks
+        `old_best[checkpoint_val_index][checkpoint_metric]` /
+        `last_value[checkpoint_val_index][checkpoint_metric]` directly,
+        letting you checkpoint on a SPECIFIC val dataset (by its 0-indexed
+        position into dataset.datasets[1:] -- same indexing as val_num in
+        calc_one_val_error) and a SPECIFIC metric by name, instead of
+        always val dataset 0's first-listed val_loss entry. Without this,
+        "use_first_only" (default True) means checkpointing silently uses
+        whichever val dataset happens to be FIRST in dataset.datasets[1:]
+        and whichever val_loss entry happens to be listed FIRST -- not
+        necessarily the same case/objective the training loss itself
+        optimizes, so don't assume it matches without checking.
         """
         val_params = self.config["optim"]["val_params"]
+        checkpoint_val_index = val_params.get("checkpoint_val_index")
+        checkpoint_metric = val_params.get("checkpoint_metric")
+        if checkpoint_val_index is not None and checkpoint_metric is not None:
+            old_perf = old_best[checkpoint_val_index][checkpoint_metric]
+            new_perf = last_value[checkpoint_val_index][checkpoint_metric]
+            return new_perf, old_perf
+
         use_first_only = val_params.get("use_first_only", True)
 
         # if this, then we only consider the first validation set

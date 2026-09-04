@@ -62,7 +62,7 @@ dataset:
     root_dir: /orcd/pool/005/donti_shared/pfdelta_data
     split: train
     task: 1.3
-    branch_perturbation_sigma: _manual_list(0, 0.03, 0.10, 0.30 | 0, 0.03, 0.10, 0.30)
+    branch_perturbation_sigma: 0.10
   - add_bus_type: true
     case_name: case14
     model: CANOS
@@ -100,10 +100,10 @@ dataset:
     task: 1.3
 functional:
   checkpoint: True
-  run_location: canos_task_3_1_joint_train_branch_perturbation
-  run_name: canos_bp_%branch_perturbation_sigma_spsg_%subgraphs_per_sample_seed_%seed
+  run_location: canos_task_3_1_260904_0
+  run_name: canos_seed_%seed
   is_debug: false
-  seed: _manual_list(0, 1, 2 | 0, 1, 2)
+  seed: _manual_list(0, 1, 2, 3, 4 | 0, 1, 2, 3, 4)
   cpu: false
   trainer_name: subgraph_finetune_trainer
   # val_loss's subproblem_consistency entry (below) actually runs on every
@@ -206,7 +206,7 @@ optim:
           # custom_losses._per_subgraph_mse and PowerBalanceLoss's own
           # aggregation), so a sample doesn't get 4x the gradient weight
           # just because it contributed 4 subgraphs.
-          subgraphs_per_sample: 4
+          subgraphs_per_sample: 64
           # Each of the subgraphs_per_sample draws independently picks one
           # of these at random, weighted by its own "proportion" (need not
           # sum to 1 -- normalized at draw time). Mixing per-draw rather
@@ -377,7 +377,7 @@ optim:
     - name: subproblem_consistency
       min_size: _connected_list(sgband -- 3 | 5)
       max_size: _connected_list(sgband -- 7 | 5)
-      subgraphs_per_sample: _manual_list(4 | 4)
+      subgraphs_per_sample: _manual_list(64 | 64)
       # Matches train_loss[0]'s subproblem_consistency component above, so
       # val reports consistency under the same strategy mix the job is
       # actually training with -- same "mix" connect key, same nine
