@@ -28,4 +28,10 @@ source ~/.bashrc
 conda activate pfdelta2
 
 CONFIG="${1:-core/configs/build_subgraph_pool.yaml}"
-python scripts/build_subgraph_pool.py --config "$CONFIG"
+# -u: unbuffered stdout/stderr -- the .out file is a redirected (non-tty)
+# stream, so Python fully buffers prints to it by default and NOTHING
+# shows up until the process exits, regardless of flush=True in any one
+# print call. -u forces every print (this script's own progress lines,
+# and anything the dataset/torch_geometric machinery prints too, e.g.
+# download progress) to actually appear live in the .out file.
+python -u scripts/build_subgraph_pool.py --config "$CONFIG"

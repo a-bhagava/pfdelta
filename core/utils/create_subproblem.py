@@ -1230,6 +1230,8 @@ def build_subgraph_pool_data(
     strategies: dict,
     generator: Optional[torch.Generator],
     pool_size: int,
+    chunk_size: Optional[int] = None,
+    progress_callback=None,
 ) -> dict:
     """
     Draws `pool_size` subgraphs for EACH strategy in `strategies`
@@ -1237,21 +1239,33 @@ def build_subgraph_pool_data(
     full `pool_size` entries; mix proportions are a draw-time-only concept,
     see `draw_subgraphs_pooled`), reusing `draw_subgraphs_batched` itself
     (a single pseudo-"sample" spanning the whole case-local index space
-    `[0, num_nodes_per_case)`, `subgraphs_per_sample=pool_size`, one call
-    per strategy at `proportion=1.0`) -- i.e. exactly the same growth logic
-    already implemented and tested there, just asked for `pool_size` draws
-    of ONE strategy at a time instead of a per-draw mix. Returns a plain
-    dict ready for `torch.save` (see `scripts/build_subgraph_pool.py`, the
-    actual offline entry point this is meant to be called from) or for
-    direct in-process use in a test.
+    `[0, num_nodes_per_case)`, one call per strategy at `proportion=1.0`)
+    -- i.e. exactly the same growth logic already implemented and tested
+    there, just asked for `pool_size` draws of ONE strategy at a time
+    instead of a per-draw mix. Returns a plain dict ready for `torch.save`
+    (see `scripts/build_subgraph_pool.py`, the actual offline entry point
+    this is meant to be called from) or for direct in-process use in a
+    test.
 
     Pure function -- takes no case_cache and mutates nothing; building a
     pool has nothing to do with training-time caching lifecycles.
+
+    `progress_callback`, if given, splits each strategy's own `pool_size`
+    draws into `chunk_size`-sized pieces (default `pool_size // 20`, at
+    least 1) -- statistically identical to one big call (every draw is
+    already independent of every other one; this only changes how many
+    calls it takes to get there) -- and calls `progress_callback(name,
+    strategy_drawn, pool_size, overall_drawn, overall_total)` after each
+    chunk, so a caller (e.g. the sbatch-launched build script) can print
+    live progress/ETA. None (default) draws each strategy in one shot, no
+    chunking overhead, exactly the prior behavior.
     """
     assert pool_size > 0, "pool_size must be positive"
     assert strategies, "strategies must name at least one sampling strategy to build a pool for"
     width = int(max_size)
     strategy_pools = {}
+    overall_total = len(strategies) * pool_size
+    overall_drawn = 0
     for name, kwargs in strategies.items():
         assert name in SAMPLING_STRATEGIES, f"Unknown sampling strategy {name!r}"
         single_strategy_cfg = {name: {"proportion": 1.0, **kwargs}}
@@ -1261,10 +1275,25 @@ def build_subgraph_pool_data(
         # straight off case_cache -- there's no adjacency-cache machinery
         # running here, just this one throwaway pool-building call.
         scratch_cache: dict = {"degrees": [len(n) for n in base_adjacency]}
-        pool_bus_subset_list, _ = draw_subgraphs_batched(
-            base_adjacency, scratch_cache, [0, num_nodes_per_case], num_nodes_per_case,
-            min_size, max_size, pool_size, generator, single_strategy_cfg, [[]],
-        )
+        if progress_callback is None:
+            pool_bus_subset_list, _ = draw_subgraphs_batched(
+                base_adjacency, scratch_cache, [0, num_nodes_per_case], num_nodes_per_case,
+                min_size, max_size, pool_size, generator, single_strategy_cfg, [[]],
+            )
+        else:
+            effective_chunk = chunk_size or max(pool_size // 20, 1)
+            pool_bus_subset_list = []
+            drawn = 0
+            while drawn < pool_size:
+                this_chunk = min(effective_chunk, pool_size - drawn)
+                chunk_list, _ = draw_subgraphs_batched(
+                    base_adjacency, scratch_cache, [0, num_nodes_per_case], num_nodes_per_case,
+                    min_size, max_size, this_chunk, generator, single_strategy_cfg, [[]],
+                )
+                pool_bus_subset_list.extend(chunk_list)
+                drawn += this_chunk
+                overall_drawn += this_chunk
+                progress_callback(name, drawn, pool_size, overall_drawn, overall_total)
         pool_nodes = torch.nn.utils.rnn.pad_sequence(
             pool_bus_subset_list, batch_first=True, padding_value=-1
         )

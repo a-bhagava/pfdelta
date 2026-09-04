@@ -35,6 +35,7 @@ Usage:
 import argparse
 import os
 import sys
+import time
 
 sys.path.append(os.getcwd())
 
@@ -78,11 +79,36 @@ def discover_full_topology(dataset, num_scan_samples: int) -> tuple:
     return base_cache["base_adjacency"], num_buses
 
 
+def make_progress_printer():
+    """Prints one line per chunk (see build_subgraph_pool_data's own
+    chunk_size/progress_callback), flushed immediately -- SLURM's .out file
+    is a redirected (non-tty) stream, so Python fully buffers stdout by
+    default and these wouldn't show up live otherwise, regardless of how
+    often we print. flush=True here covers this function's own prints even
+    if the script is ever run without -u; submit_build_subgraph_pool.sh
+    also runs python -u so every OTHER print in this file (dataset
+    loading, download progress, etc.) shows up live too, not just these."""
+    start = time.perf_counter()
+
+    def callback(strategy_name, strategy_drawn, strategy_total, overall_drawn, overall_total):
+        elapsed = time.perf_counter() - start
+        frac = overall_drawn / overall_total
+        eta = (elapsed / frac - elapsed) if frac > 0 else float("inf")
+        print(
+            f"  [{strategy_name}] {strategy_drawn}/{strategy_total}  "
+            f"(overall {overall_drawn}/{overall_total}, {frac * 100:.1f}%)  "
+            f"elapsed {elapsed:.0f}s  ETA {eta:.0f}s",
+            flush=True,
+        )
+
+    return callback
+
+
 def main(config_path: str) -> str:
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    print(f"Loading dataset ({cfg['case_name']}, split={cfg['split']}) to discover its topology...")
+    print(f"Loading dataset ({cfg['case_name']}, split={cfg['split']}) to discover its topology...", flush=True)
     dataset = build_dataset(
         cfg["dataset_name"], cfg["root_dir"], cfg["case_name"], cfg["split"],
         cfg["model_dataset_name"], cfg["task"], cfg["add_bus_type"],
@@ -90,25 +116,30 @@ def main(config_path: str) -> str:
     perturbation = getattr(dataset, "perturbation", "n")
     scan_samples = cfg.get("topology_scan_samples", 200)
     print(f"perturbation={perturbation!r} -- scanning {min(scan_samples, len(dataset))} samples "
-          f"for the case's full (union) topology...")
+          f"for the case's full (union) topology...", flush=True)
     base_adjacency, num_buses = discover_full_topology(dataset, scan_samples)
     num_edges = sum(len(n) for n in base_adjacency)
-    print(f"Case has {num_buses} buses, {num_edges} directed edges in the discovered topology.")
+    print(f"Case has {num_buses} buses, {num_edges} directed edges in the discovered topology.", flush=True)
 
     generator = torch.Generator().manual_seed(cfg.get("seed", 11))
     pool_size = int(cfg["pool_size"])
     strategies = cfg["strategies"]
+    # progress_chunk_size (optional): how many subgraphs to draw per
+    # printed progress line -- defaults (in build_subgraph_pool_data) to
+    # pool_size // 20, i.e. ~20 lines per strategy. Smaller means more
+    # frequent (chattier) updates, at a small extra per-chunk dispatch cost.
     print(f"Drawing {pool_size} subgraphs PER strategy (size {cfg['min_size']}-{cfg['max_size']}) "
-          f"for: {list(strategies.keys())}...")
+          f"for: {list(strategies.keys())}...", flush=True)
     pool = build_subgraph_pool_data(
         base_adjacency, num_buses, cfg["min_size"], cfg["max_size"], strategies, generator, pool_size,
+        chunk_size=cfg.get("progress_chunk_size"), progress_callback=make_progress_printer(),
     )
 
     output_path = cfg["output_path"]
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     torch.save(pool, output_path)
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"\nSaved pool to {output_path} ({file_size_mb:.1f} MB)")
+    print(f"\nSaved pool to {output_path} ({file_size_mb:.1f} MB)", flush=True)
 
     for name, strategy_pool in pool["strategies"].items():
         sizes = strategy_pool["pool_counts"]

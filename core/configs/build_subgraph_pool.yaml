@@ -60,6 +60,18 @@ strategies:
 # strategy, so even 1,000,000 per strategy is only tens of MB each).
 pool_size: 1000000
 
+# How many subgraphs to draw per printed progress line (see
+# scripts/build_subgraph_pool.py's own make_progress_printer) -- e.g.
+# "[bfs] 500/2000 (overall 500/4000, 12.5%) elapsed 3s ETA 21s" to the
+# .out file, so an sbatch'd run shows you how far along it is instead of
+# going silent until it's done. null (default) picks pool_size // 20, i.e.
+# ~20 lines per strategy -- lower this for chattier updates on a big
+# pool_size, raise it (or set pool_size // 5 or so) if the printing itself
+# starts to matter at a very large pool_size (each chunk is its own call
+# into the sampling engine, so more chunks means a little more overhead,
+# not just more output).
+progress_chunk_size: 10000
+
 seed: 11
 
 output_path: /orcd/pool/005/donti_shared/pfdelta_data/subgraph_pools/case500_3_7.pt
