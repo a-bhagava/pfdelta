@@ -1287,22 +1287,41 @@ def build_subgraph_pool_data(
     }
 
 
-def _load_subgraph_pool(case_cache: dict, pool_path: str, num_nodes_per_case: int) -> None:
+def _load_subgraph_pool(case_cache: dict, pool_path: str, num_nodes_per_case: int) -> bool:
     """
     Loads a pool file built by `build_subgraph_pool_data` (via
     `scripts/build_subgraph_pool.py`) into `case_cache`, once per process
-    (a no-op on every call after the first for the same `pool_path` --
-    checked by path, not re-read from disk every time).
+    (a no-op -- returns the cached decision immediately -- on every call
+    after the first for this SAME case_cache).
+
+    Returns True if the pool applies to THIS case (its own `num_nodes_per_
+    case` matches), False if it doesn't. A mismatch is NOT an error --
+    `pool_path` is one fixed value on a whole `SubproblemConsistencyLoss`
+    instance, commonly built for just the training case, while that SAME
+    instance's val-side counterpart also gets called against every OTHER
+    val dataset in a validation loop now that `consistency_val_indices`
+    typically covers all of them (case14, case30, ... not just case500) --
+    see `build_subproblem_batch`'s own adjacency_cache/case_cache
+    docstrings for why sharing one instance/cache across different cases
+    is already safe by design. Callers should fall back to live growth
+    (`draw_subgraphs_batched`) when this returns False, which is exactly
+    what `build_subproblem_batch` does -- see its own dispatch logic.
     """
-    if case_cache.get("_pool_path") == pool_path:
-        return
+    if "_pool_applies" in case_cache:
+        return case_cache["_pool_applies"]
     pool = torch.load(pool_path, map_location="cpu")
-    assert pool["num_nodes_per_case"] == num_nodes_per_case, (
-        f"Pool at {pool_path!r} was built for a {pool['num_nodes_per_case']}-bus case, "
-        f"but this run's case has {num_nodes_per_case} buses -- wrong pool file for this case."
-    )
-    case_cache["_pool_strategies"] = pool["strategies"]  # {name: {pool_nodes, pool_counts, kwargs}}
-    case_cache["_pool_path"] = pool_path
+    applies = pool["num_nodes_per_case"] == num_nodes_per_case
+    case_cache["_pool_applies"] = applies
+    if applies:
+        case_cache["_pool_strategies"] = pool["strategies"]  # {name: {pool_nodes, pool_counts, kwargs}}
+        case_cache["_pool_path"] = pool_path
+    else:
+        print(
+            f"Note: pool at {pool_path!r} was built for a {pool['num_nodes_per_case']}-bus case, "
+            f"but this call is on a {num_nodes_per_case}-bus one -- falling back to live sampling "
+            "for this case (e.g. a val loop that also evaluates on other cases)."
+        )
+    return applies
 
 
 def _pool_draws_contaminated(
@@ -1387,7 +1406,13 @@ def draw_subgraphs_pooled(
     if D == 0:
         return [], None
 
-    _load_subgraph_pool(case_cache, pool_path, num_nodes_per_case)
+    applies = _load_subgraph_pool(case_cache, pool_path, num_nodes_per_case)
+    assert applies, (
+        f"Pool at {pool_path!r} doesn't apply to this {num_nodes_per_case}-bus case -- "
+        "callers should check _load_subgraph_pool's own return value and fall back to "
+        "draw_subgraphs_batched instead of calling this directly (see build_subproblem_batch's "
+        "own dispatch logic for the pattern)."
+    )
     pool_strategies = case_cache["_pool_strategies"]
 
     if sampling_strategies is None:
@@ -2233,7 +2258,21 @@ def build_subproblem_batch(
     # here -- see _build_subproblem_vectorized's docstring.
     with _timed(stats, "sample_bus_subset"):
         ptr_list = ptr.tolist()
-        if use_base_mode and pool_path is not None:
+        # A fixed pool_path is one value on a whole SubproblemConsistencyLoss
+        # instance -- built for (typically) the training case, but that SAME
+        # instance's val-side counterpart also gets called against every
+        # OTHER val dataset in a validation loop (consistency_val_indices
+        # commonly covers all of them now, not just the training case).
+        # _load_subgraph_pool checks whether the pool actually matches THIS
+        # call's own case (by bus count) and returns False -- not an error
+        # -- when it doesn't, so those other cases correctly fall through to
+        # live growth below instead of crashing or silently using the wrong
+        # case's pool.
+        pool_applies = (
+            use_base_mode and pool_path is not None
+            and _load_subgraph_pool(case_cache, pool_path, num_nodes_per_case)
+        )
+        if pool_applies:
             # Pooled: every draw is a lookup into a pool built OFFLINE
             # (scripts/build_subgraph_pool.py), loaded once per process --
             # per_sample_missing (this batch's own N-1/N-2 contingency, if

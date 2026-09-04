@@ -58,7 +58,7 @@ strategies:
 # (closer to live sampling's own diversity), at the cost of a bigger file
 # (still small: a few bytes per bus index * max_size * pool_size per
 # strategy, so even 1,000,000 per strategy is only tens of MB each).
-pool_size: 200000
+pool_size: 1000000
 
 seed: 11
 
