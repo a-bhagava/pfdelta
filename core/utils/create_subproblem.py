@@ -1166,6 +1166,299 @@ def draw_subgraphs_batched(
     return bus_subset_list, strategy_per_subgraph
 
 
+#############################################################################
+#   POOLED sampling -- an opt-in alternative to draw_subgraphs_batched's own
+#   "grow every draw fresh, every call" behavior: a large, fixed-size pool
+#   of subgraph SHAPES (case-local bus-index sets), built ONCE OFFLINE by
+#   scripts/build_subgraph_pool.py and saved to disk, then just loaded
+#   (once per process) and indexed into (with replacement) at train time --
+#   no growth, nothing per-iteration but a lookup (plus a cheap contamination
+#   check under contingency -- see below). Deliberately NOT built lazily
+#   in-process (unlike base_adjacency/degrees/the padded-adjacency cache
+#   above) -- every SLURM job in a sweep, and every requeue of the same
+#   job, is its own fresh process, so an in-process-only cache would
+#   rebuild the pool from scratch every single time; a file built once and
+#   reused indefinitely across every run avoids that entirely.
+#
+#   ONE file per (case, min_size, max_size) -- a SEPARATE pool of pool_size
+#   shapes for EACH sampling strategy inside it (keyed by name), built with
+#   proportion 1.0 each (a strategy's own MIX proportion is meaningless at
+#   build time -- see build_subgraph_pool_data). Which strategy a given
+#   draw actually pulls from, and in what proportion, is entirely a DRAW-
+#   TIME decision (draw_subgraphs_pooled's own `sampling_strategies`
+#   argument, same schema/weighted-choice as draw_subgraphs_batched) -- so
+#   ONE file covers every strategy mix you'd ever sweep (pure_bfs,
+#   even_mix, no_bfs, ... -- see canos_task_3_1_joint_train.yaml's own
+#   9-way sweep), not one file per mix. A strategy's OTHER kwargs
+#   (restart_prob/p/degree_weight_power) ARE baked in at build time, since
+#   they change what gets grown -- a training run's own value for these is
+#   ignored when pooling (only `proportion` is read from sampling_
+#   strategies at draw time; see draw_subgraphs_pooled's docstring).
+#
+#   Safe to use even WITH N-1/N-2 contingency (PFDeltaDataset's
+#   `perturbation` "n-1"/"n-2"), as long as the pool was itself built
+#   against the case's full (uncontingent) topology -- see
+#   scripts/build_subgraph_pool.py, which discovers that full topology the
+#   same union-across-samples way update_base_topology_cache does,
+#   regardless of what perturbation the BUILD dataset itself used.
+#   draw_subgraphs_pooled checks each draw's chosen shape against its own
+#   sample's actual missing branches (from missing_edges_per_sample, the
+#   SAME per-sample contingency info build_subgraph_batch's live-growth
+#   path already computes) and redraws (same strategy, a different pool
+#   entry) whenever a missing branch's both endpoints fall inside the
+#   chosen shape -- conservative (may redraw a shape that would actually
+#   still be connected without that edge) but never lets a genuinely-
+#   affected one through. With N-1/N-2 typically removing only 1-2 branches
+#   out of hundreds, and pooled subgraphs small relative to the whole case,
+#   this rejection rate is negligible in practice -- see the module's own
+#   test for measured numbers.
+#
+#   Trades some of the augmentation's own diversity for speed -- a fixed
+#   pool, however large, is still finitely many distinct shapes reused
+#   across every sample/epoch for the rest of the run, unlike live growth's
+#   fresh draw every single call. Pick pool_size large relative to how many
+#   draws you'll ever make (num_samples * subgraphs_per_sample * epochs, in
+#   THIS run and every future one that reuses the same file) if that
+#   tradeoff matters to you.
+#############################################################################
+
+def build_subgraph_pool_data(
+    base_adjacency: list,
+    num_nodes_per_case: int,
+    min_size,
+    max_size,
+    strategies: dict,
+    generator: Optional[torch.Generator],
+    pool_size: int,
+) -> dict:
+    """
+    Draws `pool_size` subgraphs for EACH strategy in `strategies`
+    (`{name: {**kwargs}}` -- no "proportion", every strategy gets its own
+    full `pool_size` entries; mix proportions are a draw-time-only concept,
+    see `draw_subgraphs_pooled`), reusing `draw_subgraphs_batched` itself
+    (a single pseudo-"sample" spanning the whole case-local index space
+    `[0, num_nodes_per_case)`, `subgraphs_per_sample=pool_size`, one call
+    per strategy at `proportion=1.0`) -- i.e. exactly the same growth logic
+    already implemented and tested there, just asked for `pool_size` draws
+    of ONE strategy at a time instead of a per-draw mix. Returns a plain
+    dict ready for `torch.save` (see `scripts/build_subgraph_pool.py`, the
+    actual offline entry point this is meant to be called from) or for
+    direct in-process use in a test.
+
+    Pure function -- takes no case_cache and mutates nothing; building a
+    pool has nothing to do with training-time caching lifecycles.
+    """
+    assert pool_size > 0, "pool_size must be positive"
+    assert strategies, "strategies must name at least one sampling strategy to build a pool for"
+    width = int(max_size)
+    strategy_pools = {}
+    for name, kwargs in strategies.items():
+        assert name in SAMPLING_STRATEGIES, f"Unknown sampling strategy {name!r}"
+        single_strategy_cfg = {name: {"proportion": 1.0, **kwargs}}
+        # Pre-populate "degrees" (normally set by update_base_topology_cache
+        # as part of the adjacency-cache lifecycle build_subproblem_batch
+        # drives) since draw_subgraphs_batched's own snowball path reads it
+        # straight off case_cache -- there's no adjacency-cache machinery
+        # running here, just this one throwaway pool-building call.
+        scratch_cache: dict = {"degrees": [len(n) for n in base_adjacency]}
+        pool_bus_subset_list, _ = draw_subgraphs_batched(
+            base_adjacency, scratch_cache, [0, num_nodes_per_case], num_nodes_per_case,
+            min_size, max_size, pool_size, generator, single_strategy_cfg, [[]],
+        )
+        pool_nodes = torch.nn.utils.rnn.pad_sequence(
+            pool_bus_subset_list, batch_first=True, padding_value=-1
+        )
+        if pool_nodes.shape[1] < width:
+            pad = torch.full((pool_nodes.shape[0], width - pool_nodes.shape[1]), -1, dtype=torch.long)
+            pool_nodes = torch.cat([pool_nodes, pad], dim=1)
+        pool_counts = torch.tensor([s.numel() for s in pool_bus_subset_list], dtype=torch.long)
+        strategy_pools[name] = {
+            "pool_nodes": pool_nodes,  # [pool_size, max_size] long, -1 padded, CASE-LOCAL indices
+            "pool_counts": pool_counts,  # [pool_size] long
+            "kwargs": kwargs,
+        }
+
+    return {
+        "strategies": strategy_pools,
+        "num_nodes_per_case": int(num_nodes_per_case),
+        "min_size": int(min_size),
+        "max_size": int(max_size),
+        "pool_size": int(pool_size),
+    }
+
+
+def _load_subgraph_pool(case_cache: dict, pool_path: str, num_nodes_per_case: int) -> None:
+    """
+    Loads a pool file built by `build_subgraph_pool_data` (via
+    `scripts/build_subgraph_pool.py`) into `case_cache`, once per process
+    (a no-op on every call after the first for the same `pool_path` --
+    checked by path, not re-read from disk every time).
+    """
+    if case_cache.get("_pool_path") == pool_path:
+        return
+    pool = torch.load(pool_path, map_location="cpu")
+    assert pool["num_nodes_per_case"] == num_nodes_per_case, (
+        f"Pool at {pool_path!r} was built for a {pool['num_nodes_per_case']}-bus case, "
+        f"but this run's case has {num_nodes_per_case} buses -- wrong pool file for this case."
+    )
+    case_cache["_pool_strategies"] = pool["strategies"]  # {name: {pool_nodes, pool_counts, kwargs}}
+    case_cache["_pool_path"] = pool_path
+
+
+def _pool_draws_contaminated(
+    chosen_nodes: torch.Tensor,
+    sample_of_draw: torch.Tensor,
+    per_sample_missing: list,
+    num_nodes_per_case: int,
+) -> torch.Tensor:
+    """
+    `chosen_nodes`: `[D, W]` case-local node ids (-1 padded) -- the shape
+    each draw currently has selected from the pool. Returns `[D]` bool:
+    True iff that draw's own sample (`sample_of_draw[d]`, indexing
+    `per_sample_missing`) has a missing (offline THIS batch, per
+    `missing_edges_per_sample`) branch whose BOTH endpoints appear in the
+    chosen shape -- i.e. a branch this shape might have relied on for
+    connectivity when it was grown against the pool's own (fully-connected)
+    build-time topology, but that's actually offline for this specific
+    sample. Conservative: also flags shapes where the missing branch's
+    endpoints are both present but weren't actually load-bearing for
+    connectivity (redundant paths exist) -- a false positive just costs an
+    unnecessary redraw, never lets a genuinely-disconnected shape through.
+    """
+    D = chosen_nodes.shape[0]
+    max_missing = max((len(m) for m in per_sample_missing), default=0)
+    if max_missing == 0:
+        return torch.zeros(D, dtype=torch.bool)
+    K = len(per_sample_missing)
+    missing_i = torch.zeros((K, max_missing), dtype=torch.long)
+    missing_j = torch.zeros((K, max_missing), dtype=torch.long)
+    missing_valid = torch.zeros((K, max_missing), dtype=torch.bool)
+    for k, missing in enumerate(per_sample_missing):
+        for m, (i, j) in enumerate(missing):
+            missing_i[k, m] = i
+            missing_j[k, m] = j
+            missing_valid[k, m] = True
+    draw_i = missing_i[sample_of_draw]  # [D, max_missing]
+    draw_j = missing_j[sample_of_draw]
+    draw_valid = missing_valid[sample_of_draw]
+
+    has_i = (chosen_nodes.unsqueeze(2) == draw_i.unsqueeze(1)).any(dim=1)  # [D, max_missing]
+    has_j = (chosen_nodes.unsqueeze(2) == draw_j.unsqueeze(1)).any(dim=1)  # [D, max_missing]
+    return (has_i & has_j & draw_valid).any(dim=1)
+
+
+def draw_subgraphs_pooled(
+    case_cache: dict,
+    ptr_list: list,
+    num_nodes_per_case: int,
+    subgraphs_per_sample: int,
+    generator: Optional[torch.Generator],
+    pool_path: str,
+    sampling_strategies: Optional[dict] = None,
+    per_sample_missing: Optional[list] = None,
+    max_redraw_attempts: int = 5,
+) -> tuple:
+    """
+    Pooled drop-in replacement for `draw_subgraphs_batched`'s own return
+    convention -- loads (once per process, via `_load_subgraph_pool`) the
+    pool file at `pool_path` (built offline by `scripts/build_subgraph_
+    pool.py`), then for each of `D = (len(ptr_list) - 1) *
+    subgraphs_per_sample` draws: picks a strategy (weighted by `sampling_
+    strategies`' own `proportion`s, same convention as `draw_subgraphs_
+    batched`/`pick_sampling_strategy` -- None defaults to a uniform mix
+    over every strategy actually IN the pool file) and indexes a random
+    entry (with replacement) out of that strategy's own sub-pool -- no
+    growth, an O(1) lookup per draw. min_size/max_size and every strategy's
+    non-`proportion` kwargs are NOT parameters here -- they're baked into
+    the pool file; only `proportion` is read from `sampling_strategies`.
+
+    If `per_sample_missing` is given and non-empty anywhere (see
+    `missing_edges_per_sample` -- this batch's own N-1/N-2 contingency),
+    each chosen shape is checked against its own sample's missing branches
+    (`_pool_draws_contaminated`) and redrawn (same strategy, a different
+    pool entry) up to `max_redraw_attempts` times if contaminated -- see
+    this module's own POOLED sampling section for why this makes a pool
+    built from a fully-connected topology still safe to use under
+    contingency. Skipped entirely (zero overhead) when `per_sample_missing`
+    is None/all-empty, e.g. `perturbation="n"`.
+    """
+    K = len(ptr_list) - 1
+    D = K * subgraphs_per_sample
+    if D == 0:
+        return [], None
+
+    _load_subgraph_pool(case_cache, pool_path, num_nodes_per_case)
+    pool_strategies = case_cache["_pool_strategies"]
+
+    if sampling_strategies is None:
+        names = list(pool_strategies.keys())
+        weights = torch.ones(len(names), dtype=torch.float64)
+    else:
+        names = list(sampling_strategies.keys())
+        for name in names:
+            assert name in pool_strategies, (
+                f"sampling_strategies wants {name!r}, but pool file {pool_path!r} only has "
+                f"pools for {list(pool_strategies.keys())} -- rebuild the pool with this "
+                "strategy included."
+            )
+        weights = torch.tensor(
+            [float(sampling_strategies[n].get("proportion", 1.0)) for n in names], dtype=torch.float64
+        )
+    total = weights.sum()
+    assert total > 0, "sampling_strategies proportions must sum to something positive"
+    cum = torch.cumsum(weights, 0) / total
+
+    lo_per_sample = torch.tensor(ptr_list[:-1], dtype=torch.long)
+    sample_of_draw = torch.arange(K, dtype=torch.long).repeat_interleave(subgraphs_per_sample)
+    bus_offset_per_draw = lo_per_sample[sample_of_draw]
+
+    r = torch.rand(D, generator=generator).to(torch.float64)
+    strategy_idx = torch.searchsorted(cum, r, right=False).clamp(max=len(names) - 1)
+
+    width = max(p["pool_nodes"].shape[1] for p in pool_strategies.values())
+    chosen_nodes = torch.full((D, width), -1, dtype=torch.long)
+    chosen_counts = torch.zeros(D, dtype=torch.long)
+
+    def fill(positions: torch.Tensor) -> None:
+        for s_idx, name in enumerate(names):
+            group = positions[strategy_idx[positions] == s_idx]
+            if group.numel() == 0:
+                continue
+            pn = pool_strategies[name]["pool_nodes"]
+            pc = pool_strategies[name]["pool_counts"]
+            pick = torch.randint(0, pn.shape[0], (group.numel(),), generator=generator)
+            rows = pn[pick]
+            if rows.shape[1] < width:
+                pad = torch.full((rows.shape[0], width - rows.shape[1]), -1, dtype=torch.long)
+                rows = torch.cat([rows, pad], dim=1)
+            chosen_nodes[group] = rows
+            chosen_counts[group] = pc[pick]
+
+    check_contingency = bool(per_sample_missing) and any(per_sample_missing)
+    pending = torch.arange(D)
+    attempts = max_redraw_attempts if check_contingency else 1
+    for _ in range(attempts):
+        if pending.numel() == 0:
+            break
+        fill(pending)
+        if not check_contingency:
+            break
+        contaminated = _pool_draws_contaminated(chosen_nodes, sample_of_draw, per_sample_missing, num_nodes_per_case)
+        pending = contaminated.nonzero(as_tuple=True)[0]
+    # Any still-contaminated after max_redraw_attempts (astronomically rare
+    # given how small a fraction of a case a pooled subgraph covers) are
+    # accepted as-is rather than looping forever.
+
+    valid = chosen_nodes >= 0
+    draw_idx, col_idx = valid.nonzero(as_tuple=True)
+    global_idx = chosen_nodes[draw_idx, col_idx] + bus_offset_per_draw[draw_idx]
+    counts = chosen_counts.tolist()
+    bus_subset_list = list(torch.split(global_idx, counts))
+
+    strategy_per_subgraph = [names[i] for i in strategy_idx.tolist()]
+    return bus_subset_list, strategy_per_subgraph
+
+
 # Registry of sampling strategies, keyed by the name used in a
 # `sampling_strategies` config dict (see `build_subproblem_batch`). Every
 # entry has the same core call signature (adjacency, seed_bus, min_size,
@@ -1762,6 +2055,7 @@ def build_subproblem_batch(
     subgraphs_per_sample: int = 1,
     sampling_strategies: Optional[dict] = None,
     stats: Optional[dict] = None,
+    pool_path: Optional[str] = None,
 ) -> tuple:
     """
     Apply `build_subproblem` `subgraphs_per_sample` times per sample in a
@@ -1854,6 +2148,21 @@ def build_subproblem_batch(
         across repeated calls) under keys "adjacency", "sample_bus_subset",
         and "build_subproblem" (which now includes the whole batch
         assembly, not just the transform) -- see `_timed`.
+    pool_path : str, optional
+        Path to a pool file built by `scripts/build_subgraph_pool.py` (see
+        `draw_subgraphs_pooled`) -- when given, every draw is a random
+        lookup into that precomputed pool instead of a fresh traversal.
+        min_size/max_size above are ignored entirely (baked into the pool
+        file); `sampling_strategies` above is STILL used -- its `proportion`
+        fields decide the mix drawn from the pool file's own per-strategy
+        sub-pools (any other kwargs, like restart_prob/p/degree_weight_
+        power, are ignored here too -- also baked into the file). Requires
+        `adjacency_cache` (uses the same per-case `case_cache` machinery,
+        and needs "base mode" -- uniform bus count per sample -- same as
+        the adjacency cache itself). Safe even under N-1/N-2 contingency as
+        long as the pool file was itself built against the case's full
+        topology -- see this module's own POOLED sampling section above.
+        None (default) uses draw_subgraphs_batched (live growth) as before.
 
     Returns
     -------
@@ -1924,7 +2233,21 @@ def build_subproblem_batch(
     # here -- see _build_subproblem_vectorized's docstring.
     with _timed(stats, "sample_bus_subset"):
         ptr_list = ptr.tolist()
-        if use_base_mode:
+        if use_base_mode and pool_path is not None:
+            # Pooled: every draw is a lookup into a pool built OFFLINE
+            # (scripts/build_subgraph_pool.py), loaded once per process --
+            # per_sample_missing (this batch's own N-1/N-2 contingency, if
+            # any -- same info the live-growth path below already needs)
+            # is passed through so a chosen shape that relies on a branch
+            # offline for its own sample gets redrawn -- see draw_
+            # subgraphs_pooled's own docstring and this module's POOLED
+            # sampling section for why that makes pooling safe even under
+            # contingency, not just for perturbation="n".
+            bus_subset_list, strategy_per_subgraph = draw_subgraphs_pooled(
+                case_cache, ptr_list, num_nodes_per_case, subgraphs_per_sample,
+                generator, pool_path, sampling_strategies, per_sample_missing,
+            )
+        elif use_base_mode:
             # Vectorized: draws every (sample, subgraphs_per_sample) subset
             # in this batch at once instead of looping sample_bus_subset*
             # in Python -- see draw_subgraphs_batched's own docstring for

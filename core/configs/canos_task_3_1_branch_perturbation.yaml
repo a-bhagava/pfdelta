@@ -242,6 +242,30 @@ optim:
             snowball:
               proportion: _connected_list(mix -- 0, 1, 1, 0, 0, 1, 1, 1, 0 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
               degree_weight_power: 1.0
+          # To use a precomputed pool instead of live sampling (see
+          # core.utils.create_subproblem's POOLED sampling section /
+          # scripts/build_subgraph_pool.py) -- once sample_bus_subset
+          # actually dominates your profile (it does, at subgraphs_per_
+          # sample=16 -- see the profiling that motivated this): build ONE
+          # pool file for this case500/min_size=3/max_size=7 combo (run
+          # scripts/build_subgraph_pool.py once, listing all four
+          # strategies under its own `strategies` -- see that config's own
+          # comments) -- ONE file covers every mix in the "mix" sweep
+          # below, since a pool bakes in a full-size sub-pool PER STRATEGY
+          # and a training run's own sampling_strategies proportions (like
+          # the ones already swept below) pick the mix drawn from them at
+          # train time, not at build time. Then just add:
+          #   pool_path: /path/to/case500_3_7.pt
+          # as a plain sibling field here (same literal path for every job
+          # in this sweep -- no connect key needed, unlike the strategy
+          # proportions themselves). Add the SAME line to val_loss's own
+          # subproblem_consistency entry below too (it calls
+          # build_subproblem_batch independently, with its own case_cache).
+          # Safe here even though this dataset has no N-1/N-2 contingency
+          # (perturbation defaults to "n") -- and would still be safe if it
+          # did, since draw_subgraphs_pooled redraws any shape that turns
+          # out to rely on a branch offline for its own sample (see the
+          # module note for the mechanics).
           detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
                                  # false for symmetric/joint gradients instead
           voltage_weight: 1.0
@@ -375,6 +399,11 @@ optim:
         snowball:
           proportion: _connected_list(mix -- 0, 1, 1, 0, 0, 1, 1, 1, 0 | pure_bfs, even_mix, no_bfs, pure_random_walk, pure_forest_fire, pure_snowball, no_random_walk, no_forest_fire, no_snowball)
           degree_weight_power: 1.0
+      # Same pool_path opt-in as train_loss[0]'s own subproblem_consistency
+      # entry above (see the comment there) -- same ONE file, same literal
+      # path (no connect key needed -- one pool file already covers every
+      # mix in this sweep):
+      #   pool_path: /path/to/case500_3_7.pt
       detach_teacher: true
       voltage_weight: 1.0
       injection_weight: 1.0

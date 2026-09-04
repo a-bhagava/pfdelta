@@ -1,0 +1,65 @@
+# Config for scripts/build_subgraph_pool.py -- run ONCE (offline, not as
+# part of a training job) to precompute a pool of subgraphs for the
+# subgraph-consistency augmentation, then point a training config's
+# subproblem_consistency entries (both train_loss and val_loss) at the
+# saved file via `pool_path`.
+#
+# ONE file per (case, min_size, max_size) -- every strategy listed under
+# `strategies` below gets its own full-size sub-pool inside this ONE file,
+# and a training run's own sampling_strategies proportions pick the mix
+# drawn from them at TRAIN time, not here -- so this same file covers
+# every mix you'd ever sweep (e.g. canos_task_3_1_joint_train.yaml's own
+# pure_bfs/even_mix/no_bfs/... 9-way sweep). A strategy's OTHER kwargs
+# (restart_prob/p/degree_weight_power) ARE fixed here, since they change
+# what actually gets grown -- list every (strategy, kwargs) combination
+# you'll ever want a training run to be able to draw.
+#
+# min_size/max_size below must match what a training config's own
+# subproblem_consistency entries use -- the pool bakes in a specific size
+# range; a training run just draws from whatever's in the file, it doesn't
+# check that the file matches its own min_size/max_size.
+#
+# Safe to build from (and use during training on) a dataset WITH N-1/N-2
+# contingency -- this script discovers the case's full topology as a union
+# across topology_scan_samples samples, same convergence logic training
+# itself uses, so a single contingency-affected sample won't leave a
+# branch missing from the pool's own topology.
+root_dir: /orcd/pool/005/donti_shared/pfdelta_data
+dataset_name: pfdeltaCANOS
+model_dataset_name: CANOS
+task: 1.3
+add_bus_type: true
+case_name: case500
+split: train  # the split subgraph_consistency actually draws from at train time
+topology_scan_samples: 200  # how many samples to union together to discover the full topology
+
+min_size: 3
+max_size: 7
+
+# {strategy_name: {**kwargs}} -- no "proportion" here (that's train-time
+# only, see above). Omit a strategy entirely to not build a pool for it
+# (a training config that then asks for it will get a clear assertion
+# error, not silent fallback).
+strategies:
+  bfs: {}
+  random_walk:
+    restart_prob: 0.15
+  forest_fire:
+    p: 0.35
+  snowball:
+    degree_weight_power: 1.0
+
+# How many subgraphs to precompute PER strategy above (so the file holds
+# len(strategies) * pool_size total). Pick this large relative to how many
+# draws you'll ever make of any ONE strategy across every run that reuses
+# this file (num training samples per epoch * subgraphs_per_sample * that
+# strategy's own share of the mix * epochs * however many separate
+# runs/seeds share this pool) -- a bigger pool means less shape reuse
+# (closer to live sampling's own diversity), at the cost of a bigger file
+# (still small: a few bytes per bus index * max_size * pool_size per
+# strategy, so even 1,000,000 per strategy is only tens of MB each).
+pool_size: 200000
+
+seed: 11
+
+output_path: /orcd/pool/005/donti_shared/pfdelta_data/subgraph_pools/case500_3_7.pt

@@ -321,11 +321,22 @@ class SubproblemConsistencyLoss:
         profile=False,
         subgraphs_per_sample=1,
         sampling_strategies=None,
+        pool_path=None,
     ):
         self.model = None
         self.min_size = min_size
         self.max_size = max_size
         self.detach_teacher = detach_teacher
+        # Path to a pool file built offline by scripts/build_subgraph_
+        # pool.py -- when set, every draw is a random lookup into that
+        # precomputed pool instead of a fresh traversal every call (see
+        # create_subproblem.draw_subgraphs_pooled and its own module note
+        # on the no-contingency correctness requirement this relies on).
+        # min_size/max_size/sampling_strategies above are then ignored for
+        # sampling itself -- whatever the pool file was built with wins;
+        # they still matter for anything else that reads them directly off
+        # this instance. None (default) uses live growth, unchanged.
+        self.pool_path = pool_path
         # How many independent subgraphs to cut per original sample, each
         # its own random draw -- see build_subproblem_batch's own docstring
         # for what this does and doesn't cost. Every loss component below
@@ -398,6 +409,7 @@ class SubproblemConsistencyLoss:
             subgraphs_per_sample=self.subgraphs_per_sample,
             sampling_strategies=self.sampling_strategies,
             stats=self.timings,
+            pool_path=self.pool_path,
         )
         with _timed(self.timings, "second_forward"):
             sub_outputs = self.model(sub_data)
