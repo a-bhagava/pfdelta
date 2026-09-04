@@ -101,9 +101,9 @@ dataset:
 functional:
   checkpoint: True
   run_location: canos_task_3_1_260904_0
-  run_name: canos_seed_%seed
+  run_name: canos_sg_per_s_%subgraphs_per_sample_seed_%seed
   is_debug: false
-  seed: _manual_list(0, 1, 2, 3, 4 | 0, 1, 2, 3, 4)
+  seed: _manual_list(0, 1, 2 | 0, 1, 2)
   cpu: false
   trainer_name: subgraph_finetune_trainer
   # val_loss's subproblem_consistency entry (below) actually runs on every
@@ -206,7 +206,7 @@ optim:
           # custom_losses._per_subgraph_mse and PowerBalanceLoss's own
           # aggregation), so a sample doesn't get 4x the gradient weight
           # just because it contributed 4 subgraphs.
-          subgraphs_per_sample: 64
+          subgraphs_per_sample: _connected_list(sg_per_s -- 16, 64 | 16, 64)
           # Each of the subgraphs_per_sample draws independently picks one
           # of these at random, weighted by its own "proportion" (need not
           # sum to 1 -- normalized at draw time). Mixing per-draw rather
@@ -377,7 +377,7 @@ optim:
     - name: subproblem_consistency
       min_size: _connected_list(sgband -- 3 | 5)
       max_size: _connected_list(sgband -- 7 | 5)
-      subgraphs_per_sample: _manual_list(64 | 64)
+      subgraphs_per_sample: _connected_list(sg_per_s -- 16, 64 | 16, 64)
       # Matches train_loss[0]'s subproblem_consistency component above, so
       # val reports consistency under the same strategy mix the job is
       # actually training with -- same "mix" connect key, same nine
