@@ -17,6 +17,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from core.utils.registry import registry
 from core.utils.trainer_utils import MultiPrinter, _SkippedDataloader
+from core.utils.custom_losses import CombinedLoss
 
 
 @registry.register_trainer("base_trainer")
@@ -681,7 +682,23 @@ class BaseTrainer:
     def setup_pre_epoch(
         self,
     ):
-        pass
+        # Updates any weight-decay schedule (see CombinedLoss's own
+        # `weight`-as-dict support) to the epoch that's ABOUT to run --
+        # called here (before train_one_epoch) rather than after, so the
+        # upcoming epoch's training steps already see the right value, not
+        # last epoch's. Every trainer subclass's own setup_pre_epoch
+        # override chains up via super().setup_pre_epoch(), so this runs
+        # regardless of trainer type -- not specific to subgraph-
+        # consistency finetuning, since combined_loss (and so this
+        # feature) is used well beyond that one trainer.
+        self._set_epoch_on_losses(self.train_loss)
+        self._set_epoch_on_losses(self.val_loss)
+
+    def _set_epoch_on_losses(self, losses):
+        for loss in losses:
+            if isinstance(loss, CombinedLoss):
+                loss.current_epoch = self.epoch
+                self._set_epoch_on_losses(instance for _, _, instance in loss.components)
 
     def setup_post_epoch(
         self,

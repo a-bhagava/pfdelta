@@ -101,7 +101,7 @@ dataset:
 functional:
   checkpoint: True
   run_location: canos_task_3_1_260904_0
-  run_name: canos_sg_per_s_%subgraphs_per_sample_seed_%seed
+  run_name: canos_full_pbl_zero_epoch_%zero_at_epoch_sg_per_s_%subgraphs_per_sample_seed_%seed
   is_debug: false
   seed: _manual_list(0, 1, 2 | 0, 1, 2)
   cpu: false
@@ -144,16 +144,34 @@ optim:
     name: Adam
     weight_decay: 0.0
   train_params:
-    batch_size: 256
+    batch_size: 128
     epochs: 200
     train_loss:
-    # Flat N-way combined_loss: total = 1.0*PBL + w2*consistency + w3*subgraph
-    # power-balance (universal_power_balance's weight is fixed at 1 by simply
-    # not tuning it -- weight defaults to 1 when omitted).
+    # Flat N-way combined_loss: total = w1*PBL + w2*consistency + w3*subgraph
+    # power-balance. Only w1 (universal_power_balance, "full_pbl") decays --
+    # LINEARLY to exactly 0 by epoch 25 (out of 200 total -- see epochs
+    # above), then stays at 0 for the rest of training. w2/w3 below are
+    # back to plain scalars (unchanged, constant for the whole run) -- a
+    # schedule is entirely per-component/opt-in, so this is just w2/w3's
+    # `weight` reverted to a plain number instead of a `{schedule: ...}`
+    # dict; nothing else needed to leave them undecayed. See CombinedLoss's
+    # own docstring for the full weight-decay spec (every key, and what
+    # "linear"/"cosine"/"step"/"exponential" each compute) --
+    # BaseTrainer.setup_pre_epoch updates w1's schedule here (and the
+    # val-side reconstruction below, which MUST mirror it exactly, or
+    # checkpoint_metric would silently stop matching what training is
+    # actually optimizing) once per epoch automatically, no other wiring
+    # needed. Sweep zero_at_epoch itself later by tying it to its own
+    # connect key (e.g. `zero_at_epoch: _connected_list(decay_epoch --
+    # 15, 25 | 15, 25)`) the same way consw/pblw are for w2/w3's own value.
     - name: combined_loss
       profile: true
       losses:
       - name: universal_power_balance
+        weight:
+          schedule: cosine
+          initial: 1.0
+          zero_at_epoch: _manual_list(0, 10, 20, 30 | 0, 10, 20, 30)
         inputs:
           model: CANOS
       - name: subproblem_consistency
@@ -170,6 +188,7 @@ optim:
         # whichever sweep's substitution runs first, silently hiding the
         # other). The decoy's own key must be UNIQUE too -- naming both
         # decoys "weight_label" would hit this exact same collision again.
+        # Plain scalar (not decayed) -- only w1 (full_pbl) decays here.
         weight: _connected_list(consw -- 0.01 | 0.01)
         w_sg_cons: _connected_list(consw -- 0.01 | 0.01)
         # mix: which sampling-strategy blend this job uses -- own "mix"
@@ -206,7 +225,7 @@ optim:
           # custom_losses._per_subgraph_mse and PowerBalanceLoss's own
           # aggregation), so a sample doesn't get 4x the gradient weight
           # just because it contributed 4 subgraphs.
-          subgraphs_per_sample: _connected_list(sg_per_s -- 16, 64 | 16, 64)
+          subgraphs_per_sample: _connected_list(sg_per_s -- 16 | 16)
           # Each of the subgraphs_per_sample draws independently picks one
           # of these at random, weighted by its own "proportion" (need not
           # sum to 1 -- normalized at draw time). Mixing per-draw rather
@@ -276,6 +295,7 @@ optim:
         # key, independent of consw/sgband -- see the comment on w2 above for
         # why subgraph_pbl_weight_label (a second, identically-swept, but
         # UNIQUELY NAMED key) exists at all.
+        # Plain scalar (not decayed), same as w2 -- only w1 (full_pbl) decays.
         weight: _connected_list(pblw -- 10 | 10)
         w_sg_pbl: _connected_list(pblw -- 10 | 10)
         inputs:
@@ -377,7 +397,7 @@ optim:
     - name: subproblem_consistency
       min_size: _connected_list(sgband -- 3 | 5)
       max_size: _connected_list(sgband -- 7 | 5)
-      subgraphs_per_sample: _connected_list(sg_per_s -- 16, 64 | 16, 64)
+      subgraphs_per_sample: _connected_list(sg_per_s -- 16 | 16)
       # Matches train_loss[0]'s subproblem_consistency component above, so
       # val reports consistency under the same strategy mix the job is
       # actually training with -- same "mix" connect key, same nine
@@ -474,23 +494,31 @@ optim:
       loss_name: "Subgraph PBL [snowball]"
       keyword: finetune_subgraph_pbl
     # Reconstructs the EXACT same weighted objective train_loss[0] itself
-    # backpropagates (1.0*PBL + w2*consistency + w3*subgraph-PBL), on
-    # every val dataset -- built entirely from recycle_loss sub-components
+    # backpropagates (w1*PBL + w2*consistency + w3*subgraph-PBL), on every
+    # val dataset -- built entirely from recycle_loss sub-components
     # reading the SAME already-computed values the logging entries above
     # read (no extra forward pass, no second subproblem_consistency call).
     # CombinedLoss.loss_name joins each component's own loss_name with
     # "+", giving this entry the key "PBL+wConsistency+wSubgraphPBL" --
-    # what functional.checkpoint_metric above actually names. Same w2/w3
-    # as train_loss[0]'s own subproblem_consistency/recycle_loss weights,
-    # via the SAME consw/pblw connect keys, so they can never drift out of
-    # sync with what training is actually optimizing. On val datasets not
-    # in consistency_val_indices, SubgraphFinetuneTrainer.calc_one_val_
-    # error's swap (now recursive -- see _reads_from_consistency) catches
-    # this whole entry too, reporting NaN there instead of a stale value.
+    # what functional.checkpoint_metric above actually names. Same w1 DECAY
+    # SCHEDULE as train_loss[0]'s own universal_power_balance component
+    # (see that comment for what this actually does), same w2/w3 plain
+    # (undecayed) scalars via the SAME consw/pblw connect keys -- so this
+    # can never drift out of sync with what training is actually
+    # optimizing at any given epoch (BaseTrainer.setup_pre_epoch updates
+    # this combined_loss's own .current_epoch too, same as train's -- see
+    # CombinedLoss's docstring). If you change train's schedule, mirror
+    # the change here too. On val datasets not in consistency_val_indices,
+    # SubgraphFinetuneTrainer.calc_one_val_error's swap (now recursive --
+    # see _reads_from_consistency) catches this whole entry too, reporting
+    # NaN there instead of a stale value.
     - name: combined_loss
       losses:
       - name: recycle_loss
-        weight: 1.0
+        weight:
+          schedule: linear
+          initial: 1.0
+          zero_at_epoch: 25
         inputs:
           recycled_parameter: power_balance_mean
           loss_name: "PBL"

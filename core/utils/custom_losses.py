@@ -1,3 +1,4 @@
+import math
 import types
 from typing import Optional
 
@@ -10,6 +11,79 @@ from torch_geometric.nn import global_mean_pool
 from core.utils.registry import registry
 from core.utils.pf_losses_utils import PowerBalanceLoss
 from core.utils.create_subproblem import _timed, build_subproblem_batch
+
+
+def _decayed_weight(spec: dict, epoch: Optional[int]) -> float:
+    """
+    Resolves a weight-decay spec (see `CombinedLoss`'s own `weight` docs)
+    to its current numeric value for `epoch` (0-indexed, matching
+    `BaseTrainer.epoch` -- the SAME epoch counter `checkpoint`/early-stop/
+    the LR scheduler already use).
+
+    `spec` schema (all keys except `zero_at_epoch` optional):
+        schedule : str
+            "linear" (default) | "cosine" | "step" | "exponential" -- see
+            the branches below for exactly what each computes.
+        initial : float
+            Value at epoch 0 (default 1.0).
+        zero_at_epoch : int
+            The weight is EXACTLY 0.0 at and after this epoch, regardless
+            of schedule -- every schedule here is defined to reach exactly
+            zero at this epoch, not just "very small" (see "exponential"
+            below for why that needs an explicit clamp to actually hold).
+            0 is valid (and not a special case below -- see `epoch >=
+            zero_at` immediately following) -- means "always zero, from
+            epoch 0 on", e.g. for disabling a component entirely without
+            deleting/commenting it out.
+
+    `epoch=None` (no trainer has ever called `BaseTrainer._set_epoch_on_
+    losses` -- e.g. before the first epoch's setup_pre_epoch runs, or a
+    trainer that doesn't call it at all) returns `initial` unconditionally
+    REGARDLESS of `zero_at_epoch` (even 0) -- a decaying weight never
+    decays before training has actually started tracking epochs, since
+    that's the only time this could otherwise matter (by the time any
+    real forward/backward pass runs, `epoch` is always a real int, never
+    None again).
+    """
+    initial = float(spec.get("initial", 1.0))
+    zero_at = spec.get("zero_at_epoch")
+    assert zero_at is not None and zero_at >= 0, (
+        "A weight decay spec needs a non-negative zero_at_epoch, e.g. "
+        '{"schedule": "linear", "initial": 1.0, "zero_at_epoch": 100} '
+        '(0 is valid -- means "always zero").'
+    )
+    if epoch is None:
+        return initial
+    if epoch >= zero_at:
+        return 0.0
+
+    schedule = spec.get("schedule", "linear")
+    progress = epoch / zero_at  # in [0, 1)
+    if schedule == "linear":
+        return initial * (1.0 - progress)
+    if schedule == "cosine":
+        # Standard cosine-to-zero anneal: 1 at progress=0, 0 at progress=1,
+        # smooth (zero-slope) at both ends -- decays slowly at first and
+        # last, fastest through the middle.
+        return initial * 0.5 * (1.0 + math.cos(math.pi * progress))
+    if schedule == "step":
+        # A hard cutoff, not a gradual decay -- unchanged right up until
+        # zero_at_epoch, then the epoch >= zero_at check above drops it to
+        # exactly 0 in one step.
+        return initial
+    if schedule == "exponential":
+        # A pure exponential (initial * exp(-k*epoch)) never reaches
+        # exactly zero for any finite k -- this instead picks k so the
+        # value has fallen to 1% of `initial` BY zero_at_epoch, then
+        # relies on the epoch >= zero_at check above for the exact, hard
+        # zero at that epoch (matching every other schedule's own
+        # contract), rather than leaving it at "very small but nonzero".
+        k = -math.log(0.01) / zero_at
+        return initial * math.exp(-k * epoch)
+    raise ValueError(
+        f"Unknown weight decay schedule {schedule!r} -- expected one of "
+        '"linear", "cosine", "step", "exponential".'
+    )
 
 
 def _group_by_strategy(
@@ -190,13 +264,35 @@ class CombinedLoss:
         `losses: [{name: loss1, weight: 1, inputs: inp1},
                    {name: loss2, weight: lamb, inputs: inp2}]`.
 
+    A component's `weight` can be a plain number (unchanged, applied every
+    call) OR a dict describing a decay schedule that reaches exactly zero
+    by a given epoch -- e.g. to decay universal_power_balance's own weight
+    (fixed at 1 otherwise) to 0 by epoch 100:
+        - name: universal_power_balance
+          weight: {schedule: linear, initial: 1.0, zero_at_epoch: 100}
+          inputs: {model: CANOS}
+    See `_decayed_weight`'s own docstring for the full spec (every key,
+    and exactly what "linear"/"cosine"/"step"/"exponential" each compute).
+    Resolved fresh every `__call__` from `self.current_epoch` -- BaseTrainer.
+    setup_pre_epoch sets this once per epoch (see `BaseTrainer._set_epoch_
+    on_losses`) on every CombinedLoss found in train_loss/val_loss, however
+    deeply nested, so a schedule on a component anywhere in either tree
+    tracks the actual epoch automatically, no trainer-specific wiring
+    needed. `self.current_epoch` starts `None` (resolves to `initial`
+    unconditionally) until the first `setup_pre_epoch` call.
+
     `self.loss` is the combined total (same meaning as before). `self.
     components` is the list of (name, weight, instance) triples in order --
     what SubgraphFinetuneTrainer's recursive walkers use to find/wire nested
-    loss instances regardless of how many components there are. `self.
-    loss1`/`self.loss2`/`self.lamb` alias the first two components (present
-    whenever there are at least that many) for the same backward-
-    compatibility reason as the constructor form.
+    loss instances regardless of how many components there are (`weight`
+    here is whatever was given -- a plain number, or a decay-spec dict, not
+    the resolved-for-this-call value; read `.loss`/re-derive from `weight`
+    + `.current_epoch` if you need the actual number a specific call used).
+    `self.loss1`/`self.loss2`/`self.lamb` alias the first two components'
+    `(instance, instance, weight)` (present whenever there are at least
+    that many) for the same backward-compatibility reason as the
+    constructor form -- `self.lamb` is likewise the RAW weight (a dict, if
+    that component uses a decay schedule), not a resolved float.
     """
 
     def __init__(
@@ -244,6 +340,12 @@ class CombinedLoss:
         self.profile = profile
         self.timings = {} if profile else None
 
+        # Set once per epoch by BaseTrainer.setup_pre_epoch (see
+        # _set_epoch_on_losses) -- None (the default, before that ever
+        # runs) means any decay-scheduled weight below resolves to its own
+        # `initial` unconditionally; see _decayed_weight.
+        self.current_epoch = None
+
     def initialize_loss(self, loss_name, loss_inputs):
         # This is for pytorch losses
         if getattr(nn, loss_name, None) is not None:
@@ -267,7 +369,12 @@ class CombinedLoss:
         for name, weight, instance in self.components:
             with _timed(self.timings, name):
                 value = instance(predictions, labels)
-            total = weight * value if total is None else total + weight * value
+            resolved_weight = (
+                _decayed_weight(weight, self.current_epoch)
+                if isinstance(weight, dict)
+                else weight
+            )
+            total = resolved_weight * value if total is None else total + resolved_weight * value
         # Cached so a `recycle_loss` entry can report this total (e.g. for a
         # nested combined_loss) without recomputing it -- see e.g.
         # SubgraphFinetuneTrainer._wire_recycle_losses.
