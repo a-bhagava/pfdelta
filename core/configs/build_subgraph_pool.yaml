@@ -29,7 +29,7 @@ dataset_name: pfdeltaCANOS
 model_dataset_name: CANOS
 task: 1.3
 add_bus_type: true
-case_name: case500
+case_name: case118
 split: train  # the split subgraph_consistency actually draws from at train time
 topology_scan_samples: 200  # how many samples to union together to discover the full topology
 
@@ -45,7 +45,7 @@ strategies:
   random_walk:
     restart_prob: 0.15
   forest_fire:
-    p: 0.35
+    p: 0.85
   snowball:
     degree_weight_power: 1.0
 
@@ -74,4 +74,4 @@ progress_chunk_size: 10000
 
 seed: 11
 
-output_path: /orcd/pool/005/donti_shared/pfdelta_data/subgraph_pools/case500_3_7.pt
+output_path: /orcd/pool/005/donti_shared/pfdelta_data/subgraph_pools/case118_3_7.pt

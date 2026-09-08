@@ -19,9 +19,10 @@
 #   sbatch scripts/submit_build_subgraph_pool.sh core/configs/some_other_pool.yaml
 #
 #SBATCH --job-name=build_subgraph_pool
-#SBATCH --cpus-per-task=4
+#SBATCH -p pi_donti
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
-#SBATCH --time=00:30:00
+#SBATCH --time=01:00:00
 #SBATCH --output=build_subgraph_pool_%j.out
 
 source ~/.bashrc

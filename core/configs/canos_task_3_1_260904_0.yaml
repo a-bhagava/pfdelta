@@ -103,7 +103,7 @@ functional:
   run_location: canos_task_3_1_260904_0
   run_name: canos_full_pbl_zero_epoch_%zero_at_epoch_sg_per_s_%subgraphs_per_sample_seed_%seed
   is_debug: false
-  seed: _manual_list(0, 1, 2 | 0, 1, 2)
+  seed: _manual_list(0, 1, 2, 3, 4 | 0, 1, 2, 3, 4)
   cpu: false
   trainer_name: subgraph_finetune_trainer
   # val_loss's subproblem_consistency entry (below) actually runs on every
@@ -171,7 +171,7 @@ optim:
         weight:
           schedule: cosine
           initial: 1.0
-          zero_at_epoch: _manual_list(0, 10, 20, 30 | 0, 10, 20, 30)
+          zero_at_epoch: _manual_list(0, 10, 25, 50 | 0, 10, 25, 50)
         inputs:
           model: CANOS
       - name: subproblem_consistency
