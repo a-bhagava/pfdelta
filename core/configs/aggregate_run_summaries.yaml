@@ -1,0 +1,63 @@
+# Example/template for scripts/aggregate_run_summaries.py.
+# Copy this file (don't edit in place) for a new sweep -- see the script's
+# module docstring for all 3 grouping modes (name pattern / config.yaml
+# value / fully manual).
+
+# --- Auto-discovery by run name (recommended when your run names already
+# encode the sweep, e.g. via a naming scheme like
+# "canos_full_pbl_zero_epoch_%zero_at_epoch_sg_per_s_%subgraphs_per_sample_seed_%seed") ---
+# Point at one parent folder holding just the run folders you want to
+# compare. `name_pattern` uses {param} placeholders (braces, not bare
+# %param -- see module docstring for why) over each subfolder's basename.
+# `aggregate_over` lists which of those params to collapse across (e.g.
+# seed) -- runs sharing every OTHER param's value get grouped/averaged
+# together.
+folder: runs/data
+name_pattern: canos_full_pbl_zero_epoch_{zero_at_epoch}_sg_per_s_{subgraphs_per_sample}_seed_{seed}
+aggregate_over: [seed]
+
+# --- Auto-discovery by config.yaml value (alternative to name_pattern
+# above -- use when the sweep isn't in the run name) ---
+# folder: runs/_agg_smoke_test
+# sweep_key: optim.train_params.train_loss.0.losses.2.w_sg_pbl   # dotted path, list indices as plain ints
+
+# --- Manual mode (alternative to both -- explicit folders) ---
+# groups:
+#   w_sg_pbl=1:
+#     - runs/canos_k_steps15_hd256_lr1e-3_w_sg_pbl1_task_3_1_joint_0_260827_170825
+#   w_sg_pbl=10:
+#     - runs/canos_k_steps15_hd256_lr1e-3_w_sg_pbl10_task_3_1_joint_1_260827_183247
+
+# Each row: a readable label + a dotted path into summary.json.
+#   "train.<key>"     -> summary["train"][<key>]
+#   "val.<idx>.<key>"  -> summary["val"][<idx>][<key>], idx 0-4 = case14/30/57/118/500
+# <key> must match summary.json's field names exactly.
+rows:
+  - label: full pbl
+    path: train.Universal power balance subtotal (PBL Mean, unweighted)
+  - label: sub pbl
+    path: train.Subgraph power balance subtotal (unweighted)
+  - label: consistency
+    path: train.Consistency subtotal (subproblem_consistency, unweighted)
+  - label: train loss
+    path: train.PBL Mean+Subproblem consistency+Subgraph power balance
+  - label: val 14
+    path: val.0.PBL Mean
+  - label: val 30
+    path: val.1.PBL Mean
+  - label: val 57
+    path: val.2.PBL Mean
+  - label: val 118
+    path: val.3.PBL Mean
+  - label: val 500
+    path: val.4.PBL Mean
+
+# Lower is better for every row above (loss/error metrics) -- set to false
+# if a future row is a metric where higher is better.
+lower_is_better: true
+
+# Optional: where to save the table (default in auto-discovery mode is
+# `folder` itself -- that's the whole point). Override here if you want it
+# elsewhere. output_filename defaults to aggregated_results.md.
+# output_dir: runs
+output_filename: zero_epoch_sweep_results.md
