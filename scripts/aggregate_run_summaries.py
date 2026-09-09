@@ -32,6 +32,12 @@ core/configs/aggregate_run_summaries.yaml:
    sitting in one folder together, or don't share a name pattern/config.yaml
    field to group by.
 
+By default, each run contributes its summary.json (the "best checkpoint"
+snapshot base_trainer.py's save_summary writes). Set "epoch" in the config
+to instead pull that same train/val data out of train.json/val.json at one
+specific epoch (both keyed by epoch as a string, e.g. "0", "1", ...) -- use
+this to compare runs at a matched epoch rather than each run's own best.
+
 A column's runs are averaged (mean +/- std, std only shown for 2+ runs;
 std is the SAMPLE std, n-1 denominator/Bessel's correction, via
 statistics.stdev, not population std) -- so a group with several seeds
@@ -65,6 +71,40 @@ def load_summary(run_folder: str) -> dict:
         return json.load(f)
 
 
+def load_run_data(run_folder: str, epoch=None) -> dict:
+    """Returns {"train": ..., "val": ...} for one run -- either
+    summary.json as-is (epoch=None, the usual "best checkpoint" summary),
+    or, if `epoch` is given, that same shape reconstructed from train.json
+    and val.json at that specific epoch. Both files are dicts keyed by
+    epoch (as a string, e.g. "0", "1", ...) -- train.json's values are
+    already a metric-name -> value dict (matching summary["train"]) and
+    val.json's are already a list of 5 per-case dicts (matching
+    summary["val"]), so no reshaping is needed beyond picking the epoch."""
+    if epoch is None:
+        return load_summary(run_folder)
+
+    train_path = os.path.join(run_folder, "train.json")
+    val_path = os.path.join(run_folder, "val.json")
+    assert os.path.exists(train_path) and os.path.exists(val_path), (
+        f"No train.json/val.json in {run_folder!r} (needed for epoch={epoch!r})"
+    )
+    with open(train_path) as f:
+        train_by_epoch = json.load(f)
+    with open(val_path) as f:
+        val_by_epoch = json.load(f)
+
+    key = str(epoch)
+    assert key in train_by_epoch, (
+        f"epoch {epoch!r} not in {train_path!r} -- available epochs: "
+        f"{sorted(train_by_epoch, key=int)}"
+    )
+    assert key in val_by_epoch, (
+        f"epoch {epoch!r} not in {val_path!r} -- available epochs: "
+        f"{sorted(val_by_epoch, key=int)}"
+    )
+    return {"train": train_by_epoch[key], "val": val_by_epoch[key]}
+
+
 def load_yaml(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
@@ -87,6 +127,23 @@ def get_nested(config: dict, dotted_path: str):
     return value
 
 
+def has_run_data(run_folder: str, epoch=None) -> bool:
+    """Whether `run_folder` has the file(s) load_run_data would need --
+    summary.json (epoch=None) or train.json+val.json (epoch given)."""
+    if epoch is None:
+        return os.path.exists(os.path.join(run_folder, "summary.json"))
+    return os.path.exists(os.path.join(run_folder, "train.json")) and os.path.exists(
+        os.path.join(run_folder, "val.json")
+    )
+
+
+def _display_name(param_name: str) -> str:
+    """Param names double as column-label text (e.g. "zero_at_epoch=0"),
+    but read better as "zero at epoch=0" -- underscores are for
+    config.yaml/name_pattern keys, not for a table a human reads."""
+    return param_name.replace("_", " ")
+
+
 def _sweep_sort_key(value):
     """Numeric sweep values sort numerically (0.03 before 0.1); anything
     else falls back to string sort, after all numeric values."""
@@ -96,26 +153,26 @@ def _sweep_sort_key(value):
         return (1, str(value))
 
 
-def discover_groups(folder: str, sweep_key: str) -> dict:
-    """Scans `folder`'s immediate subdirectories for runs (summary.json +
-    config.yaml both present; anything else is skipped, with a note) and
-    groups them by the value of `sweep_key` read out of each run's own
-    config.yaml. Returns {group_label: [run_folder, ...]}, ordered by the
-    sweep value (numeric sort if all values are numeric)."""
+def discover_groups(folder: str, sweep_key: str, epoch=None) -> dict:
+    """Scans `folder`'s immediate subdirectories for runs (run-data file(s)
+    for `epoch` -- see has_run_data -- plus config.yaml both present;
+    anything else is skipped, with a note) and groups them by the value of
+    `sweep_key` read out of each run's own config.yaml. Returns
+    {group_label: [run_folder, ...]}, ordered by the sweep value (numeric
+    sort if all values are numeric)."""
     candidates = sorted(
         d for d in glob.glob(os.path.join(folder, "*")) if os.path.isdir(d)
     )
     value_to_folders = {}
     for run_folder in candidates:
-        summary_path = os.path.join(run_folder, "summary.json")
         config_path = os.path.join(run_folder, "config.yaml")
-        if not (os.path.exists(summary_path) and os.path.exists(config_path)):
-            print(f"  (skipping {run_folder!r} -- no summary.json/config.yaml)")
+        if not (has_run_data(run_folder, epoch) and os.path.exists(config_path)):
+            print(f"  (skipping {run_folder!r} -- missing run data and/or config.yaml)")
             continue
         value = get_nested(load_yaml(config_path), sweep_key)
         value_to_folders.setdefault(value, []).append(run_folder)
 
-    sweep_name = sweep_key.split(".")[-1]
+    sweep_name = _display_name(sweep_key.split(".")[-1])
     groups = {}
     for value in sorted(value_to_folders, key=_sweep_sort_key):
         groups[f"{sweep_name}={value}"] = value_to_folders[value]
@@ -155,22 +212,23 @@ def build_name_regex(name_pattern: str) -> re.Pattern:
     return re.compile(pattern)
 
 
-def discover_groups_by_name(folder: str, name_pattern: str, aggregate_over: list) -> dict:
-    """Scans `folder`'s immediate subdirectories for runs (summary.json
-    present; anything else skipped, with a note), extracts %params from
-    each folder's basename via `name_pattern` (see build_name_regex), and
-    groups by the extracted params EXCLUDING `aggregate_over` -- so runs
-    that only differ in an aggregate_over param (e.g. seed) land in the
-    same group and get averaged. Returns {group_label: [run_folder, ...]},
-    ordered by the (non-aggregated) param values."""
+def discover_groups_by_name(folder: str, name_pattern: str, aggregate_over: list, epoch=None) -> dict:
+    """Scans `folder`'s immediate subdirectories for runs (run-data file(s)
+    for `epoch` present -- see has_run_data; anything else skipped, with a
+    note), extracts {params} from each folder's basename via `name_pattern`
+    (see build_name_regex), and groups by the extracted params EXCLUDING
+    `aggregate_over` -- so runs that only differ in an aggregate_over param
+    (e.g. seed) land in the same group and get averaged. Returns
+    {group_label: [run_folder, ...]}, ordered by the (non-aggregated) param
+    values."""
     regex = build_name_regex(name_pattern)
     candidates = sorted(
         d for d in glob.glob(os.path.join(folder, "*")) if os.path.isdir(d)
     )
     key_to_folders = {}
     for run_folder in candidates:
-        if not os.path.exists(os.path.join(run_folder, "summary.json")):
-            print(f"  (skipping {run_folder!r} -- no summary.json)")
+        if not has_run_data(run_folder, epoch):
+            print(f"  (skipping {run_folder!r} -- missing run data)")
             continue
         m = regex.match(os.path.basename(run_folder))
         if m is None:
@@ -184,7 +242,7 @@ def discover_groups_by_name(folder: str, name_pattern: str, aggregate_over: list
 
     groups = {}
     for key in sorted(key_to_folders, key=lambda k: tuple(_sweep_sort_key(v) for _, v in k)):
-        label = ", ".join(f"{k}={v}" for k, v in key) if key else "all"
+        label = ", ".join(f"{_display_name(k)}={v}" for k, v in key) if key else "all"
         groups[label] = key_to_folders[key]
     return groups
 
@@ -240,14 +298,15 @@ def resolve_groups(cfg: dict) -> dict:
     "folder" + "name_pattern" (auto-discovery by run name), or "folder" +
     "sweep_key" (auto-discovery by config.yaml value) -- see the module
     docstring for all three modes."""
+    epoch = cfg.get("epoch")
     if "groups" in cfg:
         return cfg["groups"]
     if "name_pattern" in cfg:
         assert "folder" in cfg, "\"name_pattern\" mode also needs \"folder\""
-        groups = discover_groups_by_name(cfg["folder"], cfg["name_pattern"], cfg.get("aggregate_over", []))
+        groups = discover_groups_by_name(cfg["folder"], cfg["name_pattern"], cfg.get("aggregate_over", []), epoch)
     elif "sweep_key" in cfg:
         assert "folder" in cfg, "\"sweep_key\" mode also needs \"folder\""
-        groups = discover_groups(cfg["folder"], cfg["sweep_key"])
+        groups = discover_groups(cfg["folder"], cfg["sweep_key"], epoch)
     else:
         raise AssertionError(
             "config needs one of: \"groups\" (manual: label -> [run folders]), "
@@ -266,9 +325,10 @@ def build_table(cfg: dict, groups: dict) -> tuple:
     header = [""] + group_labels
     lower_is_better = cfg.get("lower_is_better", True)
 
-    # Load every run folder's summary.json once, not once per row.
+    # Load every run folder's data once, not once per row.
+    epoch = cfg.get("epoch")
     group_summaries = {
-        label: [load_summary(folder) for folder in folders]
+        label: [load_run_data(folder, epoch) for folder in folders]
         for label, folders in groups.items()
     }
 

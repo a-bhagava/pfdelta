@@ -56,6 +56,12 @@ rows:
 # if a future row is a metric where higher is better.
 lower_is_better: true
 
+# Optional: by default each run contributes its summary.json (the "best
+# checkpoint" snapshot). Set this to pull train/val data from
+# train.json/val.json at one specific epoch instead -- e.g. to compare
+# runs at a matched epoch rather than each run's own best.
+# epoch: 20
+
 # Optional: where to save the table (default in auto-discovery mode is
 # `folder` itself -- that's the whole point). Override here if you want it
 # elsewhere. output_filename defaults to aggregated_results.md.
