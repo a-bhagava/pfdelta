@@ -12,8 +12,8 @@
 # `aggregate_over` lists which of those params to collapse across (e.g.
 # seed) -- runs sharing every OTHER param's value get grouped/averaged
 # together.
-folder: runs/data
-name_pattern: canos_full_pbl_zero_epoch_{zero_at_epoch}_sg_per_s_{subgraphs_per_sample}_seed_{seed}
+folder: runs/canos_task_3_1_joint_train_branch_perturbation
+name_pattern: canos_bp_{bp}_spsg_{subgraphs_per_sample}_seed_{seed}
 aggregate_over: [seed]
 
 # --- Auto-discovery by config.yaml value (alternative to name_pattern
