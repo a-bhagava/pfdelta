@@ -12,8 +12,8 @@
 # `aggregate_over` lists which of those params to collapse across (e.g.
 # seed) -- runs sharing every OTHER param's value get grouped/averaged
 # together.
-folder: runs/canos_task_3_1_260906
-name_pattern: canos_w_cons_0.1_seed_{seed}
+folder: runs/canos_task_3_1_260904_0
+name_pattern: canos_sg_per_s_{sg_per_sample}_seed_{seed}
 aggregate_over: [seed]
 
 # --- Auto-discovery by config.yaml value (alternative to name_pattern
@@ -66,4 +66,4 @@ epoch: 195
 # `folder` itself -- that's the whole point). Override here if you want it
 # elsewhere. output_filename defaults to aggregated_results.md.
 # output_dir: runs
-output_filename: zero_epoch_sweep_results.md
+output_filename: sweep_results.md
