@@ -36,9 +36,9 @@ job_parameters:
 # the checkpoint the finetune config warm-starts from), same augmentation,
 # same size bands and w3 swept the same way. w1/w2 (below) are THIS file's
 # own departure from that lineage, per its name -- w1 (universal_power_
-# balance) is disabled entirely (plain 0), and w2 (subproblem_consistency)
-# decays instead of staying a plain scalar; see the train_loss comment
-# below for exactly what and why.
+# balance) GROWS from 0 up to its full weight instead of staying fixed
+# throughout, and w2 (subproblem_consistency) is a plain, undecayed
+# scalar; see the train_loss comment below for exactly what and why.
 #
 # ONE further addition on top of canos_task_3_1_joint_train.yaml (this
 # config is otherwise identical to it, feature-for-feature, apart from the
@@ -153,28 +153,39 @@ optim:
     epochs: 200
     train_loss:
     # Flat N-way combined_loss: total = w1*PBL + w2*consistency + w3*subgraph
-    # power-balance. w1 (universal_power_balance, "full_pbl") is disabled
-    # entirely here -- plain `weight: 0` for the whole run, not a schedule
-    # (nothing to ramp: this component contributes exactly nothing to the
-    # objective at any epoch). w2 (subproblem_consistency) is the
-    # one that gets a schedule in THIS config: starts at 1e-2 and decays
-    # LINEARLY to exactly 0 over 50 epochs, ramping from start_epoch to
-    # start_epoch+50 -- start_epoch itself is swept (own "cons_decay"
-    # connect key) across 50/100/125, with end_epoch tied to that SAME key
-    # so it always moves together as start_epoch+50 rather than being
-    # cross-produced against it independently. w3 below is unchanged, a
-    # plain scalar via its own "pblw" connect key. See CombinedLoss's own
-    # docstring (and `_scheduled_weight`'s) for the full weight-schedule
-    # spec (every key, and what "linear"/"cosine"/"step"/"exponential"
-    # each compute) -- BaseTrainer.setup_pre_epoch updates w2's schedule
-    # here (and the val-side reconstruction below, which MUST mirror it
-    # exactly, or checkpoint_metric would silently stop matching what
-    # training is actually optimizing) once per epoch automatically, no
-    # other wiring needed.
+    # power-balance. w1 (universal_power_balance, "full_pbl") is the one
+    # that gets a schedule in THIS config: starts at exactly 0 and GROWS,
+    # cosine-shaped, up to its full weight (1) over 50 epochs, ramping from
+    # start_epoch to start_epoch+50 -- start_epoch itself is swept (own
+    # "full_grow" connect key) across 50/100/125, with end_epoch tied to
+    # that SAME key so it always moves together as start_epoch+50 rather
+    # than being cross-produced against it independently. w2
+    # (subproblem_consistency) is a plain, undecayed scalar (1e-2) here --
+    # a schedule is entirely per-component/opt-in, so this is just w2's
+    # `weight` left as a plain number instead of a `{schedule: ...}` dict.
+    # w3 below is likewise unchanged, a plain scalar via its own "pblw"
+    # connect key. See CombinedLoss's own docstring (and
+    # `_scheduled_weight`'s) for the full weight-schedule spec (every key,
+    # and what "linear"/"cosine"/"step"/"exponential" each compute) --
+    # BaseTrainer.setup_pre_epoch updates w1's schedule here (and the
+    # val-side reconstruction below, which MUST mirror it exactly, or
+    # checkpoint_metric would silently stop matching what training is
+    # actually optimizing) once per epoch automatically, no other wiring
+    # needed.
     - name: combined_loss
       profile: true
       losses:
       - name: universal_power_balance
+        # w1 grows here: 0 -> 1, cosine, ramping over 50 epochs starting
+        # at start_epoch (own "full_grow" connect key, swept 50/100/125).
+        # end_epoch is tied to the SAME connect key (not a separate one --
+        # see the comment on train_loss above for why), so each job's
+        # end_epoch is always exactly its own start_epoch+50, never
+        # cross-produced against a mismatched start/end pair. No decoy
+        # field needed for run_name (unlike w2/w3's plain-scalar "weight"
+        # key elsewhere in this file) -- start_epoch/end_epoch are their
+        # own unique key names, so %start_epoch/%end_epoch in run_name are
+        # unambiguous already.
         weight:
           schedule: cosine
           initial: 0.0
@@ -184,19 +195,9 @@ optim:
         inputs:
           model: CANOS
       - name: subproblem_consistency
-        # w2 decays here: 1e-2 -> 0, linearly, ramping over 50 epochs
-        # starting at start_epoch (own "cons_decay" connect key, swept
-        # 50/100/125). end_epoch is tied to the SAME connect key (not a
-        # separate one -- see the comment on train_loss above for why),
-        # so each job's end_epoch is always exactly its own start_epoch+50,
-        # never cross-produced against a mismatched start/end pair. No
-        # decoy field needed for run_name (unlike w2/w3's plain-scalar
-        # "weight" key elsewhere in this file) -- start_epoch/end_epoch
-        # are their own unique key names, so %start_epoch/%end_epoch in
-        # run_name are unambiguous already.
-        weight: 1e-2
+        weight: 0.01
         # mix: which sampling-strategy blend this job uses -- own "mix"
-        # connect key, independent of cons_decay/sgband/pblw, cross-produced
+        # connect key, independent of full_grow/sgband/pblw, cross-produced
         # with everything else (9x whatever the job count already was).
         # A SIBLING of weight here (not inside inputs:), so
         # CombinedLoss's own "only read name/weight/inputs, ignore
@@ -296,13 +297,14 @@ optim:
           profile: true
       - name: recycle_loss  # pulls subproblem_consistency.pbl_loss, computed just above
         # w3: weight of the subgraph power-balance term. Own "pblw" connect
-        # key, independent of cons_decay/sgband -- w_sg_pbl below is a
+        # key, independent of full_grow/sgband -- w_sg_pbl below is a
         # decoy (see w2's history for why one might be needed to avoid a
         # run_name %weight collision with a sibling "weight" key -- not
         # actually exercised here since run_name doesn't reference either
         # placeholder currently, but kept for parity/future use).
-        # Plain scalar (not decayed) -- only w2 (subproblem_consistency)
-        # decays in this config; w1 (full_pbl) is disabled (plain 0).
+        # Plain scalar (not decayed) -- only w1 (full_pbl) has a schedule
+        # (a growth) in this config; w2 (subproblem_consistency) is also
+        # just a plain scalar, same as this.
         weight: _connected_list(pblw -- 10 | 10)
         w_sg_pbl: _connected_list(pblw -- 10 | 10)
         inputs:
@@ -507,29 +509,24 @@ optim:
     # read (no extra forward pass, no second subproblem_consistency call).
     # CombinedLoss.loss_name joins each component's own loss_name with
     # "+", giving this entry the key "PBL+wConsistency+wSubgraphPBL" --
-    # what functional.checkpoint_metric above actually names. Same w1 = 0
-    # (disabled) and w2 DECAY SCHEDULE as train_loss[0]'s own components
-    # (see that comment for what this actually does), same w3 plain
-    # (undecayed) scalar via the SAME pblw connect key, and w2's
-    # start_epoch/end_epoch via the SAME cons_decay connect key as train's
-    # own w2 -- so this can never drift out of sync with what training is
-    # actually optimizing at any given epoch (BaseTrainer.setup_pre_epoch
-    # updates this combined_loss's own .current_epoch too, same as train's
-    # -- see CombinedLoss's docstring). If you change train's schedule,
-    # mirror the change here too. On val datasets not in
-    # consistency_val_indices, SubgraphFinetuneTrainer.calc_one_val_error's
-    # swap (now recursive -- see _reads_from_consistency) catches this
-    # whole entry too, reporting NaN there instead of a stale value.
+    # what functional.checkpoint_metric above actually names. Same w1
+    # GROWTH SCHEDULE as train_loss[0]'s own universal_power_balance
+    # component (see that comment for what this actually does), same w2
+    # plain (undecayed) scalar and w3 plain (undecayed) scalar via the
+    # SAME pblw connect key, and w1's start_epoch/end_epoch via the SAME
+    # full_grow connect key as train's own w1 -- so this can never drift
+    # out of sync with what training is actually optimizing at any given
+    # epoch (BaseTrainer.setup_pre_epoch updates this combined_loss's own
+    # .current_epoch too, same as train's -- see CombinedLoss's
+    # docstring). If you change train's schedule, mirror the change here
+    # too. On val datasets not in consistency_val_indices,
+    # SubgraphFinetuneTrainer.calc_one_val_error's swap (now recursive --
+    # see _reads_from_consistency) catches this whole entry too, reporting
+    # NaN there instead of a stale value.
     - name: combined_loss
       losses:
       - name: recycle_loss
-        weight: 0  # mirrors train_loss[0]'s w1, disabled entirely
-        inputs:
-          recycled_parameter: power_balance_mean
-          loss_name: "PBL"
-          keyword: finetune_supervised
-      - name: recycle_loss
-        # Mirrors train_loss[0]'s w2 exactly -- same cons_decay connect
+        # Mirrors train_loss[0]'s w1 exactly -- same "full_grow" connect
         # key, so start_epoch/end_epoch here are always identical to
         # train's own, never drifting out of sync.
         weight:
@@ -538,6 +535,12 @@ optim:
           final: 1
           start_epoch: _connected_list(full_grow -- 50, 100, 125 | 50, 100, 125)
           end_epoch: _connected_list(full_grow -- 100, 150, 175 | 100, 150, 175)
+        inputs:
+          recycled_parameter: power_balance_mean
+          loss_name: "PBL"
+          keyword: finetune_supervised
+      - name: recycle_loss
+        weight: 0.01  # mirrors train_loss[0]'s w2, plain (undecayed) scalar
         inputs:
           recycled_parameter: loss
           loss_name: "wConsistency"
