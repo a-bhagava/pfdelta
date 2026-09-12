@@ -13,75 +13,91 @@ from core.utils.pf_losses_utils import PowerBalanceLoss
 from core.utils.create_subproblem import _timed, build_subproblem_batch
 
 
-def _decayed_weight(spec: dict, epoch: Optional[int]) -> float:
+def _scheduled_weight(spec: dict, epoch: Optional[int]) -> float:
     """
-    Resolves a weight-decay spec (see `CombinedLoss`'s own `weight` docs)
-    to its current numeric value for `epoch` (0-indexed, matching
+    Resolves a weight schedule spec (see `CombinedLoss`'s own `weight`
+    docs) to its current numeric value for `epoch` (0-indexed, matching
     `BaseTrainer.epoch` -- the SAME epoch counter `checkpoint`/early-stop/
-    the LR scheduler already use).
+    the LR scheduler already use). One shape covers decay, growth, or any
+    other initial/final pair -- direction isn't a separate setting, it
+    falls out of whichever of `initial`/`final` is bigger: holds `initial`
+    up to `start_epoch`, ramps (shape given by `schedule`) up to
+    `end_epoch`, holds `final` from there on.
 
-    `spec` schema (all keys except `zero_at_epoch` optional):
-        schedule : str
+    `spec` schema (`end_epoch` required, rest optional):
+        schedule    : str
             "linear" (default) | "cosine" | "step" | "exponential" -- see
             the branches below for exactly what each computes.
-        initial : float
-            Value at epoch 0 (default 1.0).
-        zero_at_epoch : int
-            The weight is EXACTLY 0.0 at and after this epoch, regardless
-            of schedule -- every schedule here is defined to reach exactly
-            zero at this epoch, not just "very small" (see "exponential"
-            below for why that needs an explicit clamp to actually hold).
-            0 is valid (and not a special case below -- see `epoch >=
-            zero_at` immediately following) -- means "always zero, from
-            epoch 0 on", e.g. for disabling a component entirely without
-            deleting/commenting it out.
+        initial     : float
+            Value before `start_epoch` (default 1.0).
+        final       : float
+            Value at and after `end_epoch` (default 0.0).
+        start_epoch : int
+            When it starts changing (default 0).
+        end_epoch : int
+            The weight is EXACTLY `final` at and after this epoch,
+            regardless of schedule -- every schedule here is defined to
+            reach exactly `final` at this epoch, not just "very close"
+            (see "exponential" below for why that needs an explicit clamp
+            to actually hold). Must be >= start_epoch; equal is valid (and
+            not a special case below -- see `epoch >= end` immediately
+            following) -- means "jump straight from `initial` to `final`
+            at start_epoch, no ramp". Alias: `zero_at_epoch` (older decay-
+            only configs written before `final`/`start_epoch`/`end_epoch`
+            existed use this instead -- {schedule, initial, zero_at_epoch}
+            means exactly {schedule, initial, final: 0.0, start_epoch: 0,
+            end_epoch: zero_at_epoch}, unchanged behavior).
 
     `epoch=None` (no trainer has ever called `BaseTrainer._set_epoch_on_
     losses` -- e.g. before the first epoch's setup_pre_epoch runs, or a
     trainer that doesn't call it at all) returns `initial` unconditionally
-    REGARDLESS of `zero_at_epoch` (even 0) -- a decaying weight never
-    decays before training has actually started tracking epochs, since
-    that's the only time this could otherwise matter (by the time any
-    real forward/backward pass runs, `epoch` is always a real int, never
-    None again).
+    REGARDLESS of start_epoch/end_epoch (even end_epoch=0) -- a scheduled
+    weight never changes before training has actually started tracking
+    epochs, since that's the only time this could otherwise matter (by the
+    time any real forward/backward pass runs, `epoch` is always a real
+    int, never None again).
     """
     initial = float(spec.get("initial", 1.0))
-    zero_at = spec.get("zero_at_epoch")
-    assert zero_at is not None and zero_at >= 0, (
-        "A weight decay spec needs a non-negative zero_at_epoch, e.g. "
-        '{"schedule": "linear", "initial": 1.0, "zero_at_epoch": 100} '
-        '(0 is valid -- means "always zero").'
+    final = float(spec.get("final", 0.0))
+    start = spec.get("start_epoch", 0)
+    end = spec.get("end_epoch", spec.get("zero_at_epoch"))
+    assert end is not None and end >= start >= 0, (
+        "A weight schedule spec needs an end_epoch >= start_epoch (>= 0), "
+        'e.g. {"schedule": "linear", "initial": 1.0, "final": 0.0, '
+        '"start_epoch": 0, "end_epoch": 100} (or the older "zero_at_epoch" '
+        "in place of final/start_epoch/end_epoch, for a plain decay to zero)."
     )
     if epoch is None:
         return initial
-    if epoch >= zero_at:
-        return 0.0
+    if epoch < start:
+        return initial
+    if epoch >= end:
+        return final
 
     schedule = spec.get("schedule", "linear")
-    progress = epoch / zero_at  # in [0, 1)
+    progress = (epoch - start) / (end - start)  # in (0, 1) -- end > start here
     if schedule == "linear":
-        return initial * (1.0 - progress)
+        return initial + (final - initial) * progress
     if schedule == "cosine":
-        # Standard cosine-to-zero anneal: 1 at progress=0, 0 at progress=1,
-        # smooth (zero-slope) at both ends -- decays slowly at first and
+        # Smooth (zero-slope) at both ends -- changes slowly at first and
         # last, fastest through the middle.
-        return initial * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return initial + (final - initial) * 0.5 * (1.0 - math.cos(math.pi * progress))
     if schedule == "step":
-        # A hard cutoff, not a gradual decay -- unchanged right up until
-        # zero_at_epoch, then the epoch >= zero_at check above drops it to
-        # exactly 0 in one step.
+        # A hard cutoff, not a gradual change -- unchanged at `initial`
+        # right up until end_epoch, then the epoch >= end check above
+        # jumps it to `final` in one step.
         return initial
     if schedule == "exponential":
-        # A pure exponential (initial * exp(-k*epoch)) never reaches
-        # exactly zero for any finite k -- this instead picks k so the
-        # value has fallen to 1% of `initial` BY zero_at_epoch, then
-        # relies on the epoch >= zero_at check above for the exact, hard
-        # zero at that epoch (matching every other schedule's own
-        # contract), rather than leaving it at "very small but nonzero".
-        k = -math.log(0.01) / zero_at
-        return initial * math.exp(-k * epoch)
+        # A pure exponential approach to `final` never gets there exactly
+        # for any finite k -- this instead picks k so the initial->final
+        # gap has closed 99% BY end_epoch, then relies on the epoch >= end
+        # check above for the exact, hard `final` at that epoch (matching
+        # every other schedule's own contract), rather than leaving it at
+        # "very close but not quite".
+        k = -math.log(0.01) / (end - start)
+        return final + (initial - final) * math.exp(-k * (epoch - start))
     raise ValueError(
-        f"Unknown weight decay schedule {schedule!r} -- expected one of "
+        f"Unknown weight schedule {schedule!r} -- expected one of "
         '"linear", "cosine", "step", "exponential".'
     )
 
@@ -265,13 +281,25 @@ class CombinedLoss:
                    {name: loss2, weight: lamb, inputs: inp2}]`.
 
     A component's `weight` can be a plain number (unchanged, applied every
-    call) OR a dict describing a decay schedule that reaches exactly zero
-    by a given epoch -- e.g. to decay universal_power_balance's own weight
-    (fixed at 1 otherwise) to 0 by epoch 100:
+    call) OR a dict describing a schedule -- holds `initial` up to
+    `start_epoch`, ramps to `final` by `end_epoch`, holds `final` from
+    there on. One shape covers decay OR growth (or any other initial/final
+    pair) -- direction just falls out of which of initial/final is bigger,
+    it's not a separate setting. E.g. to decay universal_power_balance's
+    own weight from 1 (fixed otherwise) to 0 by epoch 100:
         - name: universal_power_balance
-          weight: {schedule: linear, initial: 1.0, zero_at_epoch: 100}
+          weight: {schedule: linear, initial: 1.0, end_epoch: 100}
           inputs: {model: CANOS}
-    See `_decayed_weight`'s own docstring for the full spec (every key,
+    or to grow subproblem_consistency's weight from 0 up to 0.05, ramping
+    between epoch 50 and epoch 100 (0 before epoch 50, 0.05 from epoch 100
+    on):
+        - name: subproblem_consistency
+          weight: {schedule: linear, initial: 0.0, final: 0.05, start_epoch: 50, end_epoch: 100}
+          inputs: {min_size: 10, max_size: 100}
+    (Older configs use `zero_at_epoch` in place of final/start_epoch/
+    end_epoch, for the specific case of a plain decay-to-zero starting at
+    epoch 0 -- still supported unchanged, see `_scheduled_weight`.)
+    See `_scheduled_weight`'s own docstring for the full spec (every key,
     and exactly what "linear"/"cosine"/"step"/"exponential" each compute).
     Resolved fresh every `__call__` from `self.current_epoch` -- BaseTrainer.
     setup_pre_epoch sets this once per epoch (see `BaseTrainer._set_epoch_
@@ -342,8 +370,8 @@ class CombinedLoss:
 
         # Set once per epoch by BaseTrainer.setup_pre_epoch (see
         # _set_epoch_on_losses) -- None (the default, before that ever
-        # runs) means any decay-scheduled weight below resolves to its own
-        # `initial` unconditionally; see _decayed_weight.
+        # runs) means any scheduled weight below resolves to its own
+        # `initial` unconditionally; see _scheduled_weight.
         self.current_epoch = None
 
     def initialize_loss(self, loss_name, loss_inputs):
@@ -370,7 +398,7 @@ class CombinedLoss:
             with _timed(self.timings, name):
                 value = instance(predictions, labels)
             resolved_weight = (
-                _decayed_weight(weight, self.current_epoch)
+                _scheduled_weight(weight, self.current_epoch)
                 if isinstance(weight, dict)
                 else weight
             )
