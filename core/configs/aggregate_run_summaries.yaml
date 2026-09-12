@@ -12,8 +12,8 @@
 # `aggregate_over` lists which of those params to collapse across (e.g.
 # seed) -- runs sharing every OTHER param's value get grouped/averaged
 # together.
-folder: runs/canos_task_3_1_joint_train_branch_perturbation
-name_pattern: canos_bp_{bp}_spsg_{subgraphs_per_sample}_seed_{seed}
+folder: runs/canos_task_3_1_260906
+name_pattern: canos_w_cons_0.1_seed_{seed}
 aggregate_over: [seed]
 
 # --- Auto-discovery by config.yaml value (alternative to name_pattern
@@ -60,7 +60,7 @@ lower_is_better: true
 # checkpoint" snapshot). Set this to pull train/val data from
 # train.json/val.json at one specific epoch instead -- e.g. to compare
 # runs at a matched epoch rather than each run's own best.
-# epoch: 20
+epoch: 195
 
 # Optional: where to save the table (default in auto-discovery mode is
 # `folder` itself -- that's the whole point). Override here if you want it
