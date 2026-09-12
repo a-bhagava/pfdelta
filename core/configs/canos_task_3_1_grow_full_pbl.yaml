@@ -533,11 +533,11 @@ optim:
         # key, so start_epoch/end_epoch here are always identical to
         # train's own, never drifting out of sync.
         weight:
-          schedule: linear
-          initial: 0.01
-          final: 0.0
-          start_epoch: _connected_list(cons_decay -- 50, 100, 125 | 50, 100, 125)
-          end_epoch: _connected_list(cons_decay -- 100, 150, 175 | 100, 150, 175)
+          schedule: cosine
+          initial: 0.0
+          final: 1
+          start_epoch: _connected_list(full_grow -- 50, 100, 125 | 50, 100, 125)
+          end_epoch: _connected_list(full_grow -- 100, 150, 175 | 100, 150, 175)
         inputs:
           recycled_parameter: loss
           loss_name: "wConsistency"
