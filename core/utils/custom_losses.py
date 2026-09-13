@@ -419,10 +419,21 @@ class SubproblemConsistencyLoss:
     into the boundary buses' net injection (see
     `core.utils.create_subproblem`), runs the same model again on the
     subgraph, and penalizes disagreement between the two predictions: bus
-    voltages, net bus injections, and interior branch flows. Needs no
-    ground truth on the target topology -- only the model's own full-grid
-    prediction, which is why this is CANOS_PF-specific (relies on its
-    output_dict schema and its bus/PV/PQ/slack HeteroData layout).
+    voltage angle, bus voltage magnitude, net bus injections, and interior
+    branch flows. Needs no ground truth on the target topology -- only the
+    model's own full-grid prediction, which is why this is CANOS_PF-
+    specific (relies on its output_dict schema and its bus/PV/PQ/slack
+    HeteroData layout).
+
+    Bus voltage's angle and magnitude are two separate terms
+    (`angle_weight`/`magnitude_weight`), not one combined "voltage" term
+    with a single weight -- e.g. to penalize angle disagreement more
+    heavily than magnitude (voltage angle is what typically drifts most
+    under a topology change, since it's set by the whole network's power
+    flow pattern rather than a local per-bus quantity). `voltage_weight`
+    still exists as the OLD, single combined knob, for configs that don't
+    care to split it -- see each parameter's own doc below for exactly how
+    they interact.
 
     Optionally (`pbl_weight > 0`, off by default) also penalizes the
     subgraph prediction's own physics residual directly -- universal_power_
@@ -449,6 +460,8 @@ class SubproblemConsistencyLoss:
         max_size=100,
         detach_teacher=True,
         voltage_weight=1.0,
+        angle_weight=None,
+        magnitude_weight=None,
         injection_weight=1.0,
         edge_weight=1.0,
         pbl_weight=0.0,
@@ -488,6 +501,16 @@ class SubproblemConsistencyLoss:
         # strategies and their tunable parameters.
         self.sampling_strategies = sampling_strategies
         self.voltage_weight = voltage_weight
+        # angle_weight/magnitude_weight: independent weights for voltage
+        # angle vs. magnitude disagreement, overriding voltage_weight's OLD
+        # single combined weight for whichever of the two is given (None,
+        # the default for both -- leaves that one at voltage_weight's own
+        # implicit split, see .loss's own comment below for the exact
+        # backward-compat math). Set just one to change only that
+        # component; the other keeps behaving exactly as if voltage_weight
+        # alone were still in charge.
+        self.angle_weight = angle_weight
+        self.magnitude_weight = magnitude_weight
         self.injection_weight = injection_weight
         self.edge_weight = edge_weight
         self.pbl_weight = pbl_weight
@@ -588,6 +611,27 @@ class SubproblemConsistencyLoss:
                 self.voltage_loss, self.per_strategy_voltage_loss = _per_subgraph_mse(
                     student_bus, teacher_bus, voltage_batch, strategy_per_subgraph
                 )
+            # Angle (column 0) and magnitude (column 1) separately, on the
+            # SAME masked rows/batch index as voltage_loss above -- so
+            # .loss below can weight them independently instead of only
+            # ever together (see angle_weight/magnitude_weight's own doc
+            # on __init__). voltage_loss/per_strategy_voltage_loss above
+            # are kept as-is (not derived from these) purely for backward
+            # compatibility with existing readers (e.g. scripts/evaluate_
+            # consistency_transfer.py) -- they're the same combined figure
+            # as before, unaffected by angle_weight/magnitude_weight.
+            if strategy_per_subgraph is None:
+                self.angle_loss = _per_subgraph_mse(student_bus[:, 0], teacher_bus[:, 0], voltage_batch)
+                self.magnitude_loss = _per_subgraph_mse(student_bus[:, 1], teacher_bus[:, 1], voltage_batch)
+                self.per_strategy_angle_loss = {}
+                self.per_strategy_magnitude_loss = {}
+            else:
+                self.angle_loss, self.per_strategy_angle_loss = _per_subgraph_mse(
+                    student_bus[:, 0], teacher_bus[:, 0], voltage_batch, strategy_per_subgraph
+                )
+                self.magnitude_loss, self.per_strategy_magnitude_loss = _per_subgraph_mse(
+                    student_bus[:, 1], teacher_bus[:, 1], voltage_batch, strategy_per_subgraph
+                )
 
             # Net bus injections (P, Q). A genuine prediction on either side
             # whenever that bus is PV/slack there; a harmless (~0) echoed-input
@@ -646,8 +690,27 @@ class SubproblemConsistencyLoss:
                     pbl_per_subgraph, bus_batch.unique(), strategy_per_subgraph
                 )
 
+            # angle_weight/magnitude_weight (each independently optional)
+            # override voltage_weight's OLD single combined weight for
+            # whichever of the two is given; the other stays at exactly
+            # HALF voltage_weight -- since old .loss used voltage_weight *
+            # voltage_loss, and voltage_loss is itself already the mean of
+            # the angle and magnitude squared errors (equal, implicit 0.5
+            # each -- see the voltage_loss computation above), that 0.5
+            # split is what "not overridden" has to resolve to for
+            # DEFAULT behavior (neither angle_weight nor magnitude_weight
+            # given) to reproduce the OLD total bit-for-bit. Override just
+            # one to change only that component -- the other keeps
+            # tracking voltage_weight exactly as it always did.
+            angle_weight = (
+                self.angle_weight if self.angle_weight is not None else 0.5 * self.voltage_weight
+            )
+            magnitude_weight = (
+                self.magnitude_weight if self.magnitude_weight is not None else 0.5 * self.voltage_weight
+            )
             self.loss = (
-                self.voltage_weight * self.voltage_loss
+                angle_weight * self.angle_loss
+                + magnitude_weight * self.magnitude_loss
                 + self.injection_weight * self.injection_loss
                 + self.edge_weight * self.edge_loss
                 + self.pbl_weight * self.pbl_loss
@@ -656,14 +719,15 @@ class SubproblemConsistencyLoss:
             # Same weighted combination as self.loss above, but per
             # strategy -- for logging only (see RecycleLoss's dotted-path
             # support), computed over whichever strategies appear in ANY
-            # of the four per-strategy breakdowns (a strategy missing from
-            # one -- e.g. no draws contributed a voltage_loss row but some
+            # of the five per-strategy breakdowns (a strategy missing from
+            # one -- e.g. no draws contributed an angle_loss row but some
             # did contribute an injection_loss row -- just contributes 0
             # for that missing term rather than being dropped entirely).
             self.per_strategy_loss = {}
             if strategy_per_subgraph is not None:
                 strategy_names = (
-                    set(self.per_strategy_voltage_loss)
+                    set(self.per_strategy_angle_loss)
+                    | set(self.per_strategy_magnitude_loss)
                     | set(self.per_strategy_injection_loss)
                     | set(self.per_strategy_edge_loss)
                     | set(self.per_strategy_pbl_loss)
@@ -671,7 +735,8 @@ class SubproblemConsistencyLoss:
                 zero = torch.zeros((), device=self.loss.device)
                 for name in strategy_names:
                     self.per_strategy_loss[name] = (
-                        self.voltage_weight * self.per_strategy_voltage_loss.get(name, zero)
+                        angle_weight * self.per_strategy_angle_loss.get(name, zero)
+                        + magnitude_weight * self.per_strategy_magnitude_loss.get(name, zero)
                         + self.injection_weight * self.per_strategy_injection_loss.get(name, zero)
                         + self.edge_weight * self.per_strategy_edge_loss.get(name, zero)
                         + self.pbl_weight * self.per_strategy_pbl_loss.get(name, zero)
