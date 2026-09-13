@@ -272,7 +272,7 @@ optim:
           # would still be safe if it did, since draw_subgraphs_pooled
           # redraws any shape that turns out to rely on a branch offline
           # for its own sample (see the module note for the mechanics).
-          pool_path: /orcd/pool/005/donti_shared/pfdelta_data/subgraph_pools/case500_3_7.pt
+          pool_path: /orcd/pool/005/donti_shared/pfdelta_data/subgraph_pools/case118_3_7.pt
           detach_teacher: true  # stop-gradient "teacher" (full-grid) pass; set
                                  # false for symmetric/joint gradients instead
           voltage_weight: 1.0
