@@ -165,15 +165,45 @@ def _per_subgraph_mse(
     if student.numel() == 0:
         overall = torch.zeros((), device=student.device)
         return (overall, {}) if strategy_per_subgraph is not None else overall
+    per_subgraph, present = _per_subgraph_values(student, teacher, batch_idx)
+    overall = per_subgraph[present].mean()
+    if strategy_per_subgraph is None:
+        return overall
+    return overall, _group_by_strategy(per_subgraph, present, strategy_per_subgraph)
+
+
+def _per_subgraph_values(student, teacher, batch_idx):
+    """The raw building block `_per_subgraph_mse` reduces further (to an
+    overall mean, and/or a per-strategy mean) -- factored out so a caller
+    that wants the actual per-subgraph DISTRIBUTION (not just a summary
+    statistic of it, e.g. SubproblemConsistencyLoss.collect_distributions)
+    can get it directly, without `_per_subgraph_mse`'s own reduction
+    throwing it away.
+
+    Returns (per_subgraph, present):
+      - per_subgraph: global_mean_pool's raw per-subgraph-id tensor
+        (length = number of subgraphs in this batch, zero-filled at any id
+        that contributed no rows -- e.g. a promoted-local-slack subgraph
+        excluded from voltage_mask). Indexed by RAW subgraph id, same
+        convention `_group_by_strategy` relies on.
+      - present: batch_idx.unique() -- which ids actually contributed at
+        least one row. `per_subgraph[present]` is the real distribution:
+        one value per subgraph that actually contributed, in that order --
+        `.mean()` of this is `_per_subgraph_mse`'s own `overall`.
+
+    Caller must handle the `student.numel() == 0` case itself (unlike
+    `_per_subgraph_mse`) -- this has no well-defined empty-batch return
+    (there's no single subgraph count to zero-fill against), and every
+    current caller already has its own numel()==0 guard before reaching
+    here (`_per_subgraph_mse`'s, or SubproblemConsistencyLoss's own for
+    the PBL distribution).
+    """
     sq_err = (student - teacher) ** 2
     if sq_err.dim() > 1:
         sq_err = sq_err.mean(dim=-1)
     per_subgraph = global_mean_pool(sq_err, batch_idx)
     present = batch_idx.unique()
-    overall = per_subgraph[present].mean()
-    if strategy_per_subgraph is None:
-        return overall
-    return overall, _group_by_strategy(per_subgraph, present, strategy_per_subgraph)
+    return per_subgraph, present
 
 
 def loss_loader(class_name, class_inputs, class_type):
@@ -517,6 +547,33 @@ class SubproblemConsistencyLoss:
         self.generator = (
             torch.Generator().manual_seed(seed) if seed is not None else None
         )
+        # Per-subgraph loss DISTRIBUTIONS (not just the scalar mean
+        # everything above reports) -- off by default and meant to be
+        # toggled at runtime (not set via config), same pattern as
+        # `self.model`. NOT wired into training/validation at all --
+        # deliberately kept out of BaseTrainer/SubgraphFinetuneTrainer's
+        # own epoch loop (no "last epoch" concept applies to a live
+        # training run's memory budget here). Instead, scripts/evaluate_
+        # subgraph_loss_distributions.py builds a standalone, FROZEN-model
+        # eval instance, flips this on for the whole (one-off) eval pass,
+        # and reads the result back off afterward -- see that script's own
+        # module docstring for why a standalone script, not the trainer,
+        # is where this belongs. While on, every __call__ EXTENDS (not
+        # overwrites) each list below with this batch's per-subgraph
+        # values, as plain floats -- so a whole dataloader's worth of
+        # batches accumulates into one distribution per key, detached from
+        # the graph and off-GPU immediately rather than held as tensors.
+        # `self.distributions` always exists (even before collection ever
+        # starts) so reading it is never an AttributeError -- just empty
+        # until something actually collects into it. Construct a fresh
+        # instance per dataset (see evaluate_subgraph_loss_distributions.
+        # py's own evaluate_one_dataset) rather than reusing one across
+        # datasets, so distributions never need a manual reset to avoid
+        # mixing datasets together.
+        self.collect_distributions = False
+        self.distributions = {
+            "angle": [], "magnitude": [], "injection": [], "edge": [], "pbl": [],
+        }
         # Only used here for its collect_model_predictions helper (gathers
         # per-bus net P/Q injection, handling PQ/PV/slack uniformly).
         self._pbl = PowerBalanceLoss(model="CANOS")
@@ -541,6 +598,20 @@ class SubproblemConsistencyLoss:
         # SubgraphFinetuneTrainer for reset/print handling.
         self.profile = profile
         self.timings = {} if profile else None
+
+    def _collect_distribution(self, key, student, teacher, batch_idx):
+        """Extends self.distributions[key] with this batch's per-subgraph
+        values for a student-vs-teacher comparison (angle/magnitude/
+        injection/edge -- PBL is collected separately in __call__, since
+        it's a unary per-bus residual, not a comparison between two
+        predictions). No-op for an empty batch_idx (nothing to add,
+        matching _per_subgraph_mse's own numel()==0 guard -- see
+        _per_subgraph_values's docstring on why it doesn't handle this
+        itself)."""
+        if student.numel() == 0:
+            return
+        per_subgraph, present = _per_subgraph_values(student, teacher, batch_idx)
+        self.distributions[key].extend(per_subgraph[present].detach().cpu().tolist())
 
     def __call__(self, outputs, data):
         assert self.model is not None, (
@@ -632,6 +703,9 @@ class SubproblemConsistencyLoss:
                 self.magnitude_loss, self.per_strategy_magnitude_loss = _per_subgraph_mse(
                     student_bus[:, 1], teacher_bus[:, 1], voltage_batch, strategy_per_subgraph
                 )
+            if self.collect_distributions:
+                self._collect_distribution("angle", student_bus[:, 0], teacher_bus[:, 0], voltage_batch)
+                self._collect_distribution("magnitude", student_bus[:, 1], teacher_bus[:, 1], voltage_batch)
 
             # Net bus injections (P, Q). A genuine prediction on either side
             # whenever that bus is PV/slack there; a harmless (~0) echoed-input
@@ -653,6 +727,8 @@ class SubproblemConsistencyLoss:
                 self.injection_loss, self.per_strategy_injection_loss = _per_subgraph_mse(
                     student_net, teacher_net, bus_batch, strategy_per_subgraph
                 )
+            if self.collect_distributions:
+                self._collect_distribution("injection", student_net, teacher_net, bus_batch)
 
             # Interior branch flows (lines kept on both sides of the cut).
             # Edges don't get their own `.batch` from Batch.from_data_list --
@@ -672,6 +748,8 @@ class SubproblemConsistencyLoss:
                 self.edge_loss, self.per_strategy_edge_loss = _per_subgraph_mse(
                     student_edges, teacher_edges, edge_batch, strategy_per_subgraph
                 )
+            if self.collect_distributions:
+                self._collect_distribution("edge", student_edges, teacher_edges, edge_batch)
 
             # Subgraph-PBL's own per-strategy breakdown -- self._pbl's full
             # __call__ above already computed/stored .delta_P/.delta_Q (the
@@ -679,16 +757,27 @@ class SubproblemConsistencyLoss:
             # built from); reproduce its magnitude+pooling here rather than
             # touching PowerBalanceLoss itself, which is also used
             # elsewhere (the full-grid universal_power_balance loss) where
-            # "per sampling strategy" doesn't apply.
+            # "per sampling strategy" doesn't apply. Also where the PBL
+            # distribution (see collect_distributions) comes from -- same
+            # per-subgraph pooling, just kept per-subgraph instead of
+            # grouped by strategy or reduced to self.pbl_loss's own overall
+            # mean. Computed whenever EITHER is actually needed, not just
+            # for the per-strategy breakdown as before.
             self.per_strategy_pbl_loss = {}
-            if strategy_per_subgraph is not None:
+            if strategy_per_subgraph is not None or self.collect_distributions:
                 delta_pq_magn = torch.sqrt(
                     self._pbl.delta_P**2 + self._pbl.delta_Q**2 + 1e-12
                 )
                 pbl_per_subgraph = global_mean_pool(delta_pq_magn, bus_batch)
-                self.per_strategy_pbl_loss = _group_by_strategy(
-                    pbl_per_subgraph, bus_batch.unique(), strategy_per_subgraph
-                )
+                pbl_present = bus_batch.unique()
+                if strategy_per_subgraph is not None:
+                    self.per_strategy_pbl_loss = _group_by_strategy(
+                        pbl_per_subgraph, pbl_present, strategy_per_subgraph
+                    )
+                if self.collect_distributions:
+                    self.distributions["pbl"].extend(
+                        pbl_per_subgraph[pbl_present].detach().cpu().tolist()
+                    )
 
             # angle_weight/magnitude_weight (each independently optional)
             # override voltage_weight's OLD single combined weight for

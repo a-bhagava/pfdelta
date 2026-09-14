@@ -1,0 +1,73 @@
+# Per-subgraph loss DISTRIBUTION eval: evaluate an ALREADY-TRAINED, FROZEN
+# model's consistency/subgraph-PBL losses on whichever validation
+# dataset(s) you list below, keeping every individual subgraph's own
+# value (not just the mean) -- see scripts/evaluate_subgraph_loss_
+# distributions.py, which reads this directly (NOT a simple_batch/SLURM
+# sweep config like the training ones -- same non-training-config family
+# as consistency_transfer_eval.yaml).
+#
+# Answers: is the model equally self-consistent across every subgraph, or
+# do a handful of outlier subgraphs drag the mean down? A single reported
+# mean can't tell you that.
+
+# Path to the training run's OWN DIRECTORY (not model.pt itself). Used
+# three ways, each independently overridable below -- see
+# consistency_transfer_eval.yaml's own comment on source_run for the full
+# explanation (this config uses it identically):
+#   1. Default location to load weights from (<source_run>/model.pt).
+#   2. Default source for hidden_dim/k_steps/include_sent_messages/name.
+#   3. Default place to write subgraph_loss_distributions.json/.png.
+source_run: runs/canos_case500_hyperparam_later_stop/canos_k_steps15_hd256_lr1e-3_5_260824_183432
+
+# Uncomment to bypass source_run's config.yaml for the architecture.
+# model:
+#   name: canos_pf
+#   hidden_dim: 256
+#   k_steps: 15
+#   include_sent_messages: true
+
+# Uncomment to load weights from somewhere other than <source_run>/model.pt.
+# model_path: runs/canos_task_3_1_joint_train/<run_name_here>/model.pt
+
+# Uncomment to save results somewhere other than source_run itself.
+# output_dir: runs/canos_task_3_1_joint_train/<run_name_here>
+
+# Shared across every case below -- matching how the source run's own
+# dataset entries were configured (see its config.yaml's dataset.datasets).
+root_dir: /orcd/pool/005/donti_shared/pfdelta_data
+task: 1.3
+dataset_name: pfdeltaCANOS
+model_dataset_name: CANOS
+add_bus_type: true
+split: val  # which split of EACH case below to evaluate on
+
+# Which datasets to evaluate -- each gets its own full distribution (own
+# row of subplots in the plot, own key in the saved JSON).
+cases:
+  - case14
+  - case30
+  - case57
+  - case118
+  - case500
+
+# ONE size band, applied to every case above (unlike consistency_transfer_
+# eval.yaml's own case x size_band grid -- this evaluates one band's worth
+# of distributions per case, not a sweep). Pick min_size/max_size to match
+# whatever the source run actually trained/finetuned with.
+min_size: 3
+max_size: 7
+
+batch_size: 128
+subgraphs_per_sample: 4
+seed: 11
+detach_teacher: true
+# Optional -- same sampling_strategies schema as a training config's
+# subproblem_consistency entry. Omit (or leave null) for plain BFS.
+sampling_strategies: null
+# Optional -- same pool_path schema as a training config's subproblem_
+# consistency entry (see scripts/build_subgraph_pool.py). Omit (or leave
+# null) for live sampling instead of a precomputed pool.
+pool_path: null
+
+# "cuda" if available, else "cpu" -- override if you want to force one.
+device: null
