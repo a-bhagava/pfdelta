@@ -40,12 +40,16 @@ finetune.yaml / canos_task_3_1_joint_train.yaml style configs):
    sampling_strategies wasn't configured.
 """
 import os
+import sys
 import glob
 import json
 import argparse
 
 import matplotlib.pyplot as plt
 import yaml
+
+sys.path.append(os.getcwd())
+from core.utils.custom_losses import _scheduled_weight
 
 
 def find_run_folder(run_name):
@@ -133,13 +137,22 @@ def get_val_case_names(config):
 
 
 def get_consistency_weights(config):
-    """Reads w2 (subproblem_consistency's own weight) and w3 (the
-    recycle_loss pulling pbl_loss's weight) from train_loss[0]'s actual
-    resolved losses list -- the real values THIS run used, not assumed
-    defaults. Also returns the loss_name val.json uses for the subgraph-PBL
-    component (config-defined, so read rather than hardcoded)."""
+    """Reads w1 (universal_power_balance's own weight), w2 (subproblem_
+    consistency's own weight), and w3 (the recycle_loss pulling pbl_loss's
+    weight) from train_loss[0]'s actual resolved losses list -- the real
+    values THIS run used, not assumed defaults/a hardcoded 1.0 for w1.
+    Each of the three can be either a plain number (unchanged for the
+    whole run) or a decay/growth schedule spec dict (see custom_losses.
+    _scheduled_weight) -- resolve_weight below resolves whichever it is,
+    per epoch, exactly the way CombinedLoss itself does. Also returns the
+    loss_name val.json uses for the subgraph-PBL component (config-
+    defined, so read rather than hardcoded)."""
     train_loss0 = config["optim"]["train_params"]["train_loss"][0]
     losses = train_loss0["losses"]
+
+    pbl_entry = _find_loss_entry(losses, name="universal_power_balance")
+    assert pbl_entry is not None, "train_loss[0] has no universal_power_balance component"
+    w1 = pbl_entry.get("weight", 1.0)
 
     consistency_entry = _find_loss_entry(losses, name="subproblem_consistency")
     assert consistency_entry is not None, "train_loss[0] has no subproblem_consistency component"
@@ -154,7 +167,30 @@ def get_consistency_weights(config):
     assert val_subgraph_pbl_entry is not None, "val_loss has no recycle_loss pulling pbl_loss"
     subgraph_pbl_val_key = val_subgraph_pbl_entry["loss_name"]
 
-    return w2, w3, subgraph_pbl_val_key
+    return w1, w2, w3, subgraph_pbl_val_key
+
+
+def resolve_weight(weight_spec, epoch: int):
+    """weight_spec is whatever get_consistency_weights read off a config --
+    a plain number, unchanged for the whole run, or a decay/growth
+    schedule spec dict (see custom_losses.CombinedLoss's own `weight`
+    docs). Resolves a dict via the EXACT SAME _scheduled_weight function
+    CombinedLoss itself calls during training, so a scheduled weight's
+    reconstructed value here matches what training actually used at that
+    epoch, not a guess/approximation of the schedule's shape."""
+    if isinstance(weight_spec, dict):
+        return _scheduled_weight(weight_spec, epoch)
+    return weight_spec
+
+
+def _format_weight_for_label(weight_spec) -> str:
+    """Short label text for the legend -- a plain number formats as
+    itself; a schedule dict (which varies over the run, so no single
+    number represents it) names its own shape instead, e.g. "w2=cosine
+    schedule" rather than a misleading fixed value."""
+    if isinstance(weight_spec, dict):
+        return f"{weight_spec.get('schedule', 'linear')} schedule"
+    return f"{weight_spec:g}"
 
 
 def get_sampling_strategy_names(config):
@@ -181,7 +217,7 @@ def _sorted_epochs(data):
 
 
 def plot_training_objective(run_name, config, train_data, val_data, out_path, log=False):
-    w2, w3, subgraph_pbl_key = get_consistency_weights(config)
+    w1, w2, w3, subgraph_pbl_key = get_consistency_weights(config)
     case500_idx = get_case500_val_index(config)
     case500_name = get_val_case_names(config)[case500_idx]
 
@@ -197,10 +233,20 @@ def plot_training_objective(run_name, config, train_data, val_data, out_path, lo
     val_totals = []
     for e in val_epochs:
         entry = val_data[e][case500_idx]
+        epoch = int(e)
+        # w1/w2/w3 each resolved AT THIS EPOCH -- any of them can be a
+        # decay/growth schedule (not just a fixed number), and a schedule's
+        # value at epoch e is exactly what train_loss[0] itself used then
+        # (see resolve_weight). Using a hardcoded 1.0 for w1 here (as this
+        # used to) silently drifts from train_loss[0]'s own total the
+        # moment w1 isn't fixed at 1 for the whole run -- e.g. a config
+        # that decays/disables universal_power_balance (zero_at_epoch),
+        # where this would otherwise keep adding a full 1.0*PBL Mean into
+        # val's reconstruction that train's own total never included.
         total = (
-            1.0 * entry["PBL Mean"]
-            + w2 * entry["Subproblem consistency"]
-            + w3 * entry[subgraph_pbl_key]
+            resolve_weight(w1, epoch) * entry["PBL Mean"]
+            + resolve_weight(w2, epoch) * entry["Subproblem consistency"]
+            + resolve_weight(w3, epoch) * entry[subgraph_pbl_key]
         )
         val_totals.append(total)
 
@@ -209,10 +255,11 @@ def plot_training_objective(run_name, config, train_data, val_data, out_path, lo
         list(map(int, train_epochs)), train_vals,
         marker="o", linestyle="-", color="b", label="Train (train_loss[0], actual weighted total)",
     )
+    w1_label, w2_label, w3_label = (_format_weight_for_label(w) for w in (w1, w2, w3))
     plt.plot(
         list(map(int, val_epochs)), val_totals,
         marker="o", linestyle="-", color="darkorange",
-        label=f"Val: {case500_name} (reconstructed, w2={w2:g}, w3={w3:g})",
+        label=f"Val: {case500_name} (reconstructed, w1={w1_label}, w2={w2_label}, w3={w3_label})",
     )
     plt.xlabel("Training point")
     plt.ylabel("1.0*PBL + w2*consistency + w3*subgraph-PBL")
@@ -222,7 +269,7 @@ def plot_training_objective(run_name, config, train_data, val_data, out_path, lo
     plt.legend()
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
     print(f"Saved {out_path}")
-    return train_key, w2, w3, subgraph_pbl_key
+    return train_key, w1, w2, w3, subgraph_pbl_key
 
 
 def plot_universal_pbl(run_name, config, val_data, out_path, log=False):
@@ -429,7 +476,7 @@ if __name__ == "__main__":
     per_strategy_consistency_path = f"{run_path}/plot_per_strategy_consistency.png"
     per_strategy_pbl_path = f"{run_path}/plot_per_strategy_subgraph_pbl.png"
 
-    train_key, w2, w3, subgraph_pbl_key = plot_training_objective(
+    train_key, w1, w2, w3, subgraph_pbl_key = plot_training_objective(
         args.run_name, config, train_data, val_data, objective_path, log=args.log
     )
     plot_universal_pbl(args.run_name, config, val_data, pbl_path, log=args.log)
@@ -442,7 +489,10 @@ if __name__ == "__main__":
 
     print()
     print(f"Training objective key (train.json): {train_key!r}")
-    print(f"Reconstruction weights: w2 (consistency) = {w2}, w3 (subgraph-PBL) = {w3}")
+    print(
+        f"Reconstruction weights: w1 (PBL) = {w1}, w2 (consistency) = {w2}, "
+        f"w3 (subgraph-PBL) = {w3}"
+    )
     print(f"Subgraph-PBL val.json key: {subgraph_pbl_key!r}")
     if plotted_strategies:
         print(f"Sampling strategies plotted (per-strategy consistency, case500): {plotted_strategies}")
