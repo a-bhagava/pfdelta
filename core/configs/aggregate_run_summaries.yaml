@@ -12,8 +12,8 @@
 # `aggregate_over` lists which of those params to collapse across (e.g.
 # seed) -- runs sharing every OTHER param's value get grouped/averaged
 # together.
-folder: runs/canos_task_3_1_grow_full_pbl
-name_pattern: canos_118_full_grow_start_{grow_start}_end_{grow_end}_seed_{seed}
+folder: runs/canos_task_3_1_118_cons_weights
+name_pattern: canos_118_detach_teacher_{detach_teacher}_injection_weight_{inj_weight}_seed_{seed}
 aggregate_over: [seed]
 
 # --- Auto-discovery by config.yaml value (alternative to name_pattern
@@ -66,4 +66,4 @@ lower_is_better: true
 # `folder` itself -- that's the whole point). Override here if you want it
 # elsewhere. output_filename defaults to aggregated_results.md.
 # output_dir: runs
-output_filename: sweep_results.md
+output_filename: 500_angle_weight_sweep_results.md
