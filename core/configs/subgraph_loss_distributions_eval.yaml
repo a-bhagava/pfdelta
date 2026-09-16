@@ -20,7 +20,7 @@
 #   3. Default place to write subgraph_loss_distributions.json/.png.
 # sbatch scripts/submit_subgraph_loss_distributions_eval.sh with this
 # config as-is.
-source_run: runs/canos_case500_hyperparam_later_stop/canos_k_steps15_hd256_lr1e-3_5_260824_183432
+# source_run: runs/canos_case500_hyperparam_later_stop/canos_k_steps15_hd256_lr1e-3_5_260824_183432
 
 # --- Batch mode (alternative to source_run above) ---
 # Evaluate every run folder matching a name pattern, each as its OWN
@@ -36,8 +36,8 @@ source_run: runs/canos_case500_hyperparam_later_stop/canos_k_steps15_hd256_lr1e-
 # output_dir (below) unset in this mode -- both need to resolve PER RUN
 # off each job's own source_run, not point every job at the same one.
 #
-# folder: runs/canos_task_3_1_260906
-# name_pattern: canos_full_pbl_zero_epoch_{zero_at_epoch}_sg_per_s_{subgraphs_per_sample}_seed_{seed}
+folder: runs/canos_task_3_1_118_cons_weights
+name_pattern: canos_118_detach_teacher_{detach_teacher}_injection_weight_{injection_weight}_seed_{seed}
 #
 # python scripts/submit_subgraph_loss_distributions_eval_batch.py --config <this file>
 # (add --dry_run first to see which runs would be submitted without actually sbatch-ing anything)
