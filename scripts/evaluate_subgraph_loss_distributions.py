@@ -192,12 +192,25 @@ def plot_distributions(results: dict, out_path: str):
     print(f"\nSaved {out_path}")
 
 
-def main(config_path: str) -> dict:
+def main(config_path: str, source_run_override: str = None) -> dict:
     """Returns {case_name: {metric: [values]}} -- factored out of the CLI
     entry point so it can be called directly too, same as evaluate_
-    consistency_transfer.py's own main()."""
+    consistency_transfer.py's own main().
+
+    `source_run_override`, if given, replaces cfg["source_run"] entirely --
+    this is how scripts/submit_subgraph_loss_distributions_eval_batch.py
+    fans a single shared eval config out across many discovered runs
+    (each its own sbatch job, each passing a DIFFERENT run here) without
+    needing a separate config file per run. Leave model_path/output_dir
+    unset in a config meant to be used this way -- see the config's own
+    comment on why those would otherwise apply to every discovered run
+    identically instead of resolving per-run off source_run like model_
+    path/output_dir's own defaults do.
+    """
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
+    if source_run_override is not None:
+        cfg["source_run"] = source_run_override
 
     device = torch.device(
         cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -261,5 +274,13 @@ def main(config_path: str) -> dict:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument(
+        "--source_run", type=str, default=None,
+        help=(
+            "Overrides cfg[\"source_run\"] -- for scripts/submit_subgraph_"
+            "loss_distributions_eval_batch.py's own per-run sbatch calls, "
+            "which all share ONE eval config but each need a different run."
+        ),
+    )
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, source_run_override=args.source_run)

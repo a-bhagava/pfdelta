@@ -10,6 +10,7 @@
 # do a handful of outlier subgraphs drag the mean down? A single reported
 # mean can't tell you that.
 
+# --- Single-run mode ---
 # Path to the training run's OWN DIRECTORY (not model.pt itself). Used
 # three ways, each independently overridable below -- see
 # consistency_transfer_eval.yaml's own comment on source_run for the full
@@ -17,7 +18,29 @@
 #   1. Default location to load weights from (<source_run>/model.pt).
 #   2. Default source for hidden_dim/k_steps/include_sent_messages/name.
 #   3. Default place to write subgraph_loss_distributions.json/.png.
+# sbatch scripts/submit_subgraph_loss_distributions_eval.sh with this
+# config as-is.
 source_run: runs/canos_case500_hyperparam_later_stop/canos_k_steps15_hd256_lr1e-3_5_260824_183432
+
+# --- Batch mode (alternative to source_run above) ---
+# Evaluate every run folder matching a name pattern, each as its OWN
+# sbatch job (see scripts/submit_subgraph_loss_distributions_eval_batch.py,
+# which reads folder/name_pattern instead of source_run when both are
+# present -- delete/comment source_run above if you use this mode, since
+# whichever is present takes over). Same {param} name_pattern syntax as
+# scripts/aggregate_run_summaries.py (see that script's own docstring for
+# why braces, not bare %param) -- reused directly, so a pattern you've
+# already written for aggregation works here unchanged. Every OTHER
+# setting below (cases/min_size/etc.) is shared, unchanged, across every
+# matched run -- only source_run varies, one per job. Leave model_path/
+# output_dir (below) unset in this mode -- both need to resolve PER RUN
+# off each job's own source_run, not point every job at the same one.
+#
+# folder: runs/canos_task_3_1_260906
+# name_pattern: canos_full_pbl_zero_epoch_{zero_at_epoch}_sg_per_s_{subgraphs_per_sample}_seed_{seed}
+#
+# python scripts/submit_subgraph_loss_distributions_eval_batch.py --config <this file>
+# (add --dry_run first to see which runs would be submitted without actually sbatch-ing anything)
 
 # Uncomment to bypass source_run's config.yaml for the architecture.
 # model:

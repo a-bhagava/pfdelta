@@ -11,6 +11,11 @@
 # evaluate_subgraph_loss_distributions.py's own sys.path.append(os.getcwd())):
 #   sbatch scripts/submit_subgraph_loss_distributions_eval.sh
 #   sbatch scripts/submit_subgraph_loss_distributions_eval.sh core/configs/some_other_eval.yaml
+#   sbatch scripts/submit_subgraph_loss_distributions_eval.sh core/configs/some_other_eval.yaml runs/some_run
+# The optional 2nd arg overrides the config's own source_run -- this is how
+# scripts/submit_subgraph_loss_distributions_eval_batch.py fans ONE shared
+# config out across many discovered runs, each its own sbatch call; you can
+# also pass it by hand for a one-off run without editing the config.
 #
 #SBATCH --job-name=subgraph_loss_distributions_eval
 #SBATCH -p mit_normal_gpu,mit_preemptable,pi_donti_gpu
@@ -26,8 +31,13 @@ source ~/.bashrc
 conda activate pfdelta2
 
 CONFIG="${1:-core/configs/subgraph_loss_distributions_eval.yaml}"
+SOURCE_RUN="${2:-}"
 # -u: unbuffered stdout/stderr -- the .out file is a redirected (non-tty)
 # stream, so Python fully buffers prints to it by default and nothing
 # shows up until the process exits. -u forces every print (per-case
 # progress, the min/mean/std/max summary) to appear live in the .out file.
-python -u scripts/evaluate_subgraph_loss_distributions.py --config "$CONFIG"
+if [ -n "$SOURCE_RUN" ]; then
+    python -u scripts/evaluate_subgraph_loss_distributions.py --config "$CONFIG" --source_run "$SOURCE_RUN"
+else
+    python -u scripts/evaluate_subgraph_loss_distributions.py --config "$CONFIG"
+fi
