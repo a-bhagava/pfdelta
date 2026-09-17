@@ -1,0 +1,17 @@
+# Aggregates scripts/evaluate_subgraph_loss_distributions.py's own output
+# (subgraph_loss_distributions.json) across every run folder matching a
+# name pattern under one parent folder -- see scripts/aggregate_subgraph_
+# loss_distributions.py, which reads this directly.
+
+# Same discovery/grouping as core/configs/aggregate_run_summaries.yaml's
+# own name_pattern mode: {param} placeholders (braces, not bare %param),
+# aggregate_over collapses those params across runs (e.g. seeds) into one
+# group instead of a separate column per value.
+folder: runs/canos_task_3_1_118_cons_weights
+name_pattern: canos_118_detach_teacher_{detach_teacher}_injection_weight_{injection_weight}_seed_{seed}
+aggregate_over: [seed]
+
+# Where to save the two output files (default: folder itself).
+# output_dir: runs
+output_filename: subgraph_loss_distributions_aggregate.md
+output_json_filename: subgraph_loss_distributions_aggregate.json
