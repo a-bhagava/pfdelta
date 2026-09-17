@@ -15,6 +15,11 @@ loss is across seeds) alongside "mean of maxes" (how consistent the worst
 outlier is across seeds), not just one pooled number. std is the SAMPLE std
 (n-1, statistics.stdev), same convention as aggregate_run_summaries.py.
 
+Which of min/mean/std/max to aggregate is configurable (`stats:` in the
+config, default all four) -- e.g. `stats: [mean, max]` to skip min/std
+entirely and halve the table size when you only care about the typical
+case and the worst outlier.
+
 Usage:
     python scripts/aggregate_subgraph_loss_distributions.py --config core/configs/aggregate_subgraph_loss_distributions.yaml
 """
@@ -38,8 +43,20 @@ from scripts.aggregate_run_summaries import (
 )
 from scripts.evaluate_subgraph_loss_distributions import METRICS, summarize
 
-STATS = ["min", "mean", "std", "max"]
+ALL_STATS = ["min", "mean", "std", "max"]
 DISTRIBUTIONS_FILENAME = "subgraph_loss_distributions.json"
+
+
+def resolve_stats(cfg: dict) -> list:
+    """Which per-run stats (min/mean/std/max) to aggregate and report --
+    `stats:` in the config, defaulting to all four. Order in the config is
+    preserved (so e.g. `stats: [max, mean]` puts max rows above mean rows
+    in the output) rather than forcing ALL_STATS's own order."""
+    stats = cfg.get("stats", ALL_STATS)
+    unknown = set(stats) - set(ALL_STATS)
+    assert not unknown, f"stats {sorted(unknown)} not in {ALL_STATS}"
+    assert stats, "stats can't be empty -- pick at least one of " + str(ALL_STATS)
+    return stats
 
 
 def discover_groups(folder: str, name_pattern: str, aggregate_over: list) -> dict:
@@ -75,16 +92,16 @@ def discover_groups(folder: str, name_pattern: str, aggregate_over: list) -> dic
     return groups
 
 
-def aggregate_group(run_folders: list) -> dict:
+def aggregate_group(run_folders: list, stats: list = ALL_STATS) -> dict:
     """Returns {case: {metric: {stat: (agg_mean, agg_std, n_runs)}}} --
-    for each (case, metric), gathers each run's OWN summarize() stat
-    (min/mean/std/max over that run's per-subgraph distribution) and
-    computes the mean+std of each ACROSS runs. A run missing a (case,
-    metric) entirely (e.g. it evaluated a different case list, or that
-    metric had zero subgraphs -- see summarize()'s own count=0 case) just
-    doesn't contribute to that cell, same as summary.json's own NaN-
-    dropping convention -- n_runs (the 3rd tuple element) says how many
-    runs actually did."""
+    for each (case, metric), gathers each run's OWN summarize() stat (one
+    of min/mean/std/max, whichever `stats` asks for, over that run's
+    per-subgraph distribution) and computes the mean+std of each ACROSS
+    runs. A run missing a (case, metric) entirely (e.g. it evaluated a
+    different case list, or that metric had zero subgraphs -- see
+    summarize()'s own count=0 case) just doesn't contribute to that cell,
+    same as summary.json's own NaN-dropping convention -- n_runs (the 3rd
+    tuple element) says how many runs actually did."""
     # per_run_stats[case][metric][stat] = [run1's own stat value, run2's, ...]
     per_run_stats = {}
     for run_folder in run_folders:
@@ -95,8 +112,8 @@ def aggregate_group(run_folders: list) -> dict:
             by_metric = per_run_stats.setdefault(case, {})
             for metric in METRICS:
                 s = summarize(case_dist.get(metric, []))
-                by_stat = by_metric.setdefault(metric, {stat: [] for stat in STATS})
-                for stat in STATS:
+                by_stat = by_metric.setdefault(metric, {stat: [] for stat in stats})
+                for stat in stats:
                     if s[stat] is not None:
                         by_stat[stat].append(s[stat])
 
@@ -125,7 +142,7 @@ def _ordered_cases(all_results: dict) -> list:
     return seen
 
 
-def render_markdown(all_results: dict) -> str:
+def render_markdown(all_results: dict, stats: list = ALL_STATS) -> str:
     group_labels = list(all_results.keys())
     cases = _ordered_cases(all_results)
     lines = []
@@ -135,7 +152,7 @@ def render_markdown(all_results: dict) -> str:
         lines.append("| " + " | ".join(header) + " |")
         lines.append("| " + " | ".join(["---"] * len(header)) + " |")
         for case in cases:
-            for stat in STATS:
+            for stat in stats:
                 row = [f"{case} {stat}"]
                 for group_label in group_labels:
                     cell = all_results[group_label].get(case, {}).get(metric, {}).get(stat)
@@ -153,6 +170,7 @@ def main(config_path: str) -> dict:
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
+    stats = resolve_stats(cfg)
     groups = discover_groups(cfg["folder"], cfg["name_pattern"], cfg.get("aggregate_over", []))
     assert groups, (
         f"No run folders under {cfg['folder']!r} matched name_pattern "
@@ -164,8 +182,10 @@ def main(config_path: str) -> dict:
         for folder in folders:
             print(f"    {folder}")
     print()
+    print(f"Aggregating stats: {stats}")
+    print()
 
-    all_results = {label: aggregate_group(folders) for label, folders in groups.items()}
+    all_results = {label: aggregate_group(folders, stats) for label, folders in groups.items()}
 
     output_dir = cfg.get("output_dir", cfg["folder"])
     os.makedirs(output_dir, exist_ok=True)
@@ -177,7 +197,7 @@ def main(config_path: str) -> dict:
 
     out_md = os.path.join(output_dir, cfg.get("output_filename", "subgraph_loss_distributions_aggregate.md"))
     with open(out_md, "w") as f:
-        f.write(render_markdown(all_results))
+        f.write(render_markdown(all_results, stats))
     print(f"Saved readable summary to {out_md}")
 
     return all_results

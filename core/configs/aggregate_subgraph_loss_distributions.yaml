@@ -11,6 +11,11 @@ folder: runs/canos_task_3_1_118_cons_weights
 name_pattern: canos_118_detach_teacher_{detach_teacher}_injection_weight_{injection_weight}_seed_{seed}
 aggregate_over: [seed]
 
+# Optional: which per-run stats to aggregate/report -- default is all
+# four. Order here controls row order in the output. E.g. to only see the
+# typical case and the worst outlier (skip min/std entirely):
+# stats: [mean, max]
+
 # Where to save the two output files (default: folder itself).
 # output_dir: runs
 output_filename: subgraph_loss_distributions_aggregate.md
